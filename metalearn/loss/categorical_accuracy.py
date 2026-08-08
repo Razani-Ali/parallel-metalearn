@@ -14,7 +14,7 @@ class CategoricalAccuracy(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             logits (torch.Tensor): Predicted class logits of shape (..., num_classes).
@@ -28,7 +28,7 @@ class CategoricalAccuracy(nn.Module):
 
         # 2. Check element-wise equality between predictions and target indices
         correct_predictions = torch.eq(preds, targets).to(torch.float32)
-
+        correct_predictions = correct_predictions * mask if mask else correct_predictions
         # 3. Compute mean accuracy across all target instances
         accuracy = torch.mean(correct_predictions)
 

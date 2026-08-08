@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Tuple, Any, Optional
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from metalearn.loss.base import BaseLoss
 from .categorical_accuracy import CategoricalAccuracy
 
@@ -34,11 +35,15 @@ class CrossEntropy(BaseLoss):
 
         if "samples_mask" in targets:
             mask = targets["samples_mask"]
-            logits, labels = logits[mask], labels[mask]
 
-        loss = self.ce_loss_fn(logits, labels)
+            raw_loss = F.cross_entropy(logits, labels, reduction='none')
+            loss = (raw_loss * mask).sum() / (mask.sum() + 1e-8)
 
-        metric = self.metric_fn(logits, labels)
+        else:
+            mask = None
+            loss = self.ce_loss_fn(logits, labels)
+
+        metric = self.metric_fn(logits, labels, mask)
 
         if not isinstance(metric, torch.Tensor):
             metric = torch.tensor(metric, device=loss.device, dtype=torch.float32)
