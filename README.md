@@ -1,6 +1,6 @@
 
 
-# 🚀 MetaLearn: Blazing-Fast, VMAP-Powered Functional Meta-Learning for PyTorch
+# 🚀 Parallel-MetaLearn: Blazing-Fast, VMAP-Powered Functional Meta-Learning for PyTorch
 
 **Stop writing slow `for` loops over your meta-batches. Stop rewriting your PyTorch models into awkward functional syntax.**
 
@@ -10,7 +10,7 @@ Whether you are doing Few-Shot Classification, Domain Adaptation, Semantic Segme
 
 ---
 
-## 🔥 Why Choose MetaLearn? (The Game Changers)
+## 🔥 Why Choose Parallel-MetaLearn? (The Game Changers)
 
 Existing libraries (like `learn2learn` or `higher`) force you into difficult compromises: they either use sequential `for` loops that bottleneck your GPU, or they require you to completely rewrite your model's forward pass to accept explicit parameters (e.g., `torch.functional.conv1d(x, weight=params['w'])`).
 
