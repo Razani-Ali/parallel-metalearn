@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parallel-metalearn"
+version = "0.1.0"
+description = "A high-performance, vmap-accelerated functional meta-learning framework built natively on PyTorch."
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = [
+    "meta-learning",
+    "maml",
+    "anil",
+    "few-shot-learning",
+    "pytorch",
+    "vmap",
+    "functional-api",
+    "fault-diagnosis",
+    "deep-learning"
+]
+authors = [
+    { name = "Ali Razani" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.5.0",
+    "numpy>=2.0.0",
+    "tqdm>=4.60.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Razani-Ali/parallel-metalearn"
+"Bug Tracker" = "https://github.com/Razani-Ali/parallel-metalearn/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["metalearn*"]

@@ -30,6 +30,7 @@ class BaseInnerOptimizer(nn.Module, ABC):
     def __init__(
         self, 
         initial_fast_weights: OrderedDict,
+        first_order: bool = False,
         max_inner_steps: int = 5, 
         per_layer: bool = False, 
         per_step: bool = False,
@@ -40,6 +41,7 @@ class BaseInnerOptimizer(nn.Module, ABC):
 
         Args:
             initial_fast_weights (OrderedDict): Dictionary of initial model fast weights.
+            first_order (bool): whether to break computational graph (e.g. FOMAML) or not (second order derivatives)
             max_inner_steps (int): Maximum number of adaptation steps in the inner loop.
             per_layer (bool): If True, assigns distinct learning rates per layer/parameter.
             per_step (bool): If True, assigns distinct learning rates per adaptation step.
@@ -47,6 +49,7 @@ class BaseInnerOptimizer(nn.Module, ABC):
         """
         super().__init__()
         self.max_inner_steps = max_inner_steps
+        self.first_order = first_order
         self.per_layer = per_layer
         self.per_step = per_step
         # Extract parameter names to structure per-layer parameter dictionaries
@@ -110,13 +113,12 @@ class BaseInnerOptimizer(nn.Module, ABC):
         gradients: Dict[str, torch.Tensor], 
         state: Dict, 
         step: int, 
-        first_order: bool = False
     ) -> Tuple[Dict[str, torch.Tensor], Dict]:
         """
         Abstract forward pass to update fast weights based on computed gradients.
         Must be overridden by subclasses.
         """
-        pass
+        pass #shall return adapted weights and state dictionary
 
     def inner_lr_parameters(self) -> Iterator[Tuple[str, nn.Parameter]]:
         """

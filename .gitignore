@@ -12,9 +12,14 @@ ENV/
 *.mat
 *.npz
 *.ipynb
+*.pth
+*.pt
 data/
 .vscode/
 downloads/
+logs/
+checkpoint.pth
+checkpoint.pth.temp
 
 # Distribution / Packaging
 build/
