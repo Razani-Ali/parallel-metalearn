@@ -34,7 +34,7 @@ class CrossEntropy(BaseLoss):
         labels = targets["labels"]
 
         if "samples_mask" in targets:
-            mask = targets["samples_mask"]
+            mask = targets["samples_mask"].to(torch.float32)
 
             raw_loss = F.cross_entropy(logits, labels, reduction='none')
             loss = (raw_loss * mask).sum() / (mask.sum() + 1e-8)
