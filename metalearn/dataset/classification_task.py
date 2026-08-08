@@ -235,7 +235,6 @@ class MetaTaskDataset(Dataset):
         way: Union[int, Tuple[int, int]] = 5,
         support_shot: Union[int, Tuple[int, int]] = 1,
         query_shot: Union[int, Tuple[int, int]] = 15,
-        imbalanced_shot: bool = False,
         max_classes: Optional[int] = None,
         tasks_pool: Optional[List[Tuple[int, ...]]] = None,
     ):
@@ -248,7 +247,6 @@ class MetaTaskDataset(Dataset):
             way (Union[int, Tuple[int, int]]): Number of classes per task (fixed int or (min, max) tuple).
             support_shot (Union[int, Tuple[int, int]]): Support samples per class (fixed or tuple).
             query_shot (Union[int, Tuple[int, int]]): Query samples per class (fixed or tuple).
-            imbalanced_shot (bool): If True, samples a different random shot count for EACH class in a task.
             max_classes (Optional[int]): Maximum available classes if tasks_pool is None.
             tasks_pool (Optional[List[Tuple[int, ...]]]): Predefined list of class ID tuples.
         """
@@ -258,7 +256,7 @@ class MetaTaskDataset(Dataset):
         self.way = way
         self.support_shot = support_shot
         self.query_shot = query_shot
-        self.imbalanced_shot = imbalanced_shot
+        self.imbalanced_shot = type(support_shot) == tuple or type(query_shot) == tuple
 
         # Set up available classes for random task generation if no predefined pool is provided
         if self.tasks_pool is None:
@@ -331,7 +329,7 @@ class MetaTaskDataset(Dataset):
         y_tensor = torch.from_numpy(y_arr)
 
         # 2. Check if padding is needed
-        if num_real_samples < target_max_samples:
+        if self.imbalanced_shot:
             pad_count = target_max_samples - num_real_samples
 
             # Pad X with zeros along sample dimension
@@ -345,19 +343,22 @@ class MetaTaskDataset(Dataset):
 
             # Construct binary mask (1.0 for real data, 0.0 for padding)
             mask = torch.cat([
-                torch.ones(num_real_samples, dtype=torch.float32),
-                torch.zeros(pad_count, dtype=torch.float32)
+                torch.ones(num_real_samples, dtype=torch.bool),
+                torch.zeros(pad_count, dtype=torch.bool)
             ], dim=0)
+
+            y_dict = {
+                "labels": y_final,
+                "samples_mask": mask
+            }
 
         else:
             x_final = x_tensor
             y_final = y_tensor
-            mask = torch.ones(num_real_samples, dtype=torch.bool)
 
-        y_dict = {
-            "labels": y_final,
-            "samples_mask": mask
-        }
+            y_dict = {
+                "labels": y_final,
+            }
 
         return x_final, y_dict
 
