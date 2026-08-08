@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Tuple, Any, Optional
 import torch
 import torch.nn as nn
-from loss.base import BaseLoss
+from metalearn.loss.base import BaseLoss
 from .categorical_accuracy import CategoricalAccuracy
 
 

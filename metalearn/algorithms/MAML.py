@@ -1,13 +1,13 @@
 from collections import OrderedDict
 from typing import Dict, Optional, Tuple
 import torch
-from loss.base import BaseLoss
+from metalearn.loss.base import BaseLoss
 from .BaseLearner import MetaOptimizer
 from .MetaUtils import get_per_step_loss_weights
-from inner_optimizers.base import BaseInnerOptimizer
+from metalearn.inner_optimizers.base import BaseInnerOptimizer
 from torch.func import grad, vmap
 from model_wrappers.MAMLWrapper import MAML_Model
-from loss import LabelEncoder
+from metalearn.loss import LabelEncoder
 
 
 # ==============================================================================
