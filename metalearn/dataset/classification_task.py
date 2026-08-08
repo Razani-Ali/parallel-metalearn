@@ -349,18 +349,15 @@ class MetaTaskDataset(Dataset):
                 torch.zeros(pad_count, dtype=torch.float32)
             ], dim=0)
 
-            y_dict = {
-                "labels": y_final,
-                "samples_mask": mask
-            }
-
         else:
             x_final = x_tensor
             y_final = y_tensor
+            mask = torch.ones(num_real_samples, dtype=torch.bool)
 
-            y_dict = {
-                "labels": y_final,
-            }
+        y_dict = {
+            "labels": y_final,
+            "samples_mask": mask
+        }
 
         return x_final, y_dict
 

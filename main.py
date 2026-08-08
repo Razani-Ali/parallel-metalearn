@@ -140,7 +140,7 @@ class Backbone(nn.Module):
 
         # 2. Global Classification Head (192 input features -> num_classes)
         # 64 chunks * 3 features per chunk = 192 total features
-        self.global_feature = nn.Linear(64 * 3, 16)
+        self.global_feature = nn.Linear(64 * 3, 32)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -176,7 +176,7 @@ class Head(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.layer = nn.Linear(64 * 16, 3)
+        self.layer = nn.Linear(32, 3)
 
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
