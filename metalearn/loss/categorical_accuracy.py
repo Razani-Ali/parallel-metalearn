@@ -28,7 +28,7 @@ class CategoricalAccuracy(nn.Module):
 
         # 2. Check element-wise equality between predictions and target indices
         correct_predictions = torch.eq(preds, targets).to(torch.float32)
-        correct_predictions = correct_predictions * mask if mask else correct_predictions
+        correct_predictions = correct_predictions * mask if mask is not None else correct_predictions
         # 3. Compute mean accuracy across all target instances
         accuracy = torch.mean(correct_predictions)
 
