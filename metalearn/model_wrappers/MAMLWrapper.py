@@ -109,7 +109,15 @@ class MAML_Model(nn.Module):
                 if param.requires_grad and name.startswith("head.")
             )
 
-        # Case 2: Specific whitelist of parameter names provided
+        # Case 2: BOIL - Only adapt parameters belonging to the body or backbone
+        if isinstance(self.fast_weights, str) and self.fast_weights.upper() == "BOIL":
+            return OrderedDict(
+                (name, param)
+                for name, param in self.named_parameters()
+                if param.requires_grad and name.startswith("backbone.")
+            )
+
+        # Case 3: Specific whitelist of parameter names provided
         elif isinstance(self.fast_weights, list):
             return OrderedDict(
                 (name, param)
@@ -120,7 +128,7 @@ class MAML_Model(nn.Module):
                 )
             )
 
-        # Case 3: Standard MAML - Adapt all trainable parameters
+        # Case 4: Standard MAML - Adapt all trainable parameters
         elif self.fast_weights is None:
             return OrderedDict(
                 (name, param)

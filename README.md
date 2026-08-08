@@ -32,6 +32,7 @@ Currently, the library natively supports the most powerful gradient-based meta-l
 * ✅ **MAML** (Model-Agnostic Meta-Learning)
 * ✅ **FOMAML** (First Order MAML)
 * ✅ **ANIL** (Almost No Inner Loop)
+* ✅ **BOIL** (Body Only update in Inner Loop)
 * ✅ **Meta-SGD** (Learnable inner learning rates)
 * ✅ **MAML++** (Multi-Step Loss Optimization & Per-step parameters)
 
