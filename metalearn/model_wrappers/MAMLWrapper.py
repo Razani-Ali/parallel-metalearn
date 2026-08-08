@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from collections import OrderedDict
 from typing import Dict, List, Optional, Union
-from dataset.Scalers import BaseScaler
+from metalearn.dataset.Scalers import BaseScaler
 
 # ==============================================================================
 # ACKNOWLEDGEMENT & CITATION:
