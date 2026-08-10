@@ -27,15 +27,17 @@ Existing libraries (like `learn2learn` or `higher`) force you into difficult com
 
 ## 🛠️ Supported Algorithms
 
-Currently, the library natively supports the most powerful gradient-based meta-learning algorithms out of the box:
+Currently, the library natively supports a comprehensive suite of gradient-based, metric-based, and first-order meta-learning algorithms out of the box:
 
 * ✅ **MAML** (Model-Agnostic Meta-Learning)
-* ✅ **FOMAML** (First Order MAML)
+* ✅ **FOMAML** (First-Order MAML)
 * ✅ **ANIL** (Almost No Inner Loop)
-* ✅ **BOIL** (Body Only update in Inner Loop)
-* ✅ **Meta-SGD** (Learnable inner learning rates)
-* ✅ **MAML++** (Multi-Step Loss Optimization & Per-step parameters)
-
+* ✅ **BOIL** (Body-Only Inner Loop)
+* ✅ **Meta-SGD** (Learnable per-layer inner learning rates)
+* ✅ **MAML++** (Multi-Step Loss Optimization & per-step learnable parameters)
+* ✅ **ProtoMAML (v1 & v2)** (Prototypical MAML featuring First/Second-Order derivatives, body-only updates, multi-step loss accumulation, and per-layer & per-step learnable inner learning rates)
+* ✅ **Prototypical Networks** (ProtoNet with customizable & learnable distance metrics)
+* ✅ **Reptile** (Fast, first-order weight-delta meta-optimization)
 ---
 
 ## 📦 Core Features at a Glance
@@ -101,10 +103,8 @@ history, best_metric, best_loss = trainer.train(
 
 We are constantly pushing the boundaries of what is possible in functional meta-learning. In our upcoming releases, look forward to:
 
-* **Recurrent Network Support:** Native, `vmap`-safe support for `LSTM` and `GRU` layers.
 * **Advanced Noise Management:** Robust meta-learning under input perturbations.
-* **New Meta-Algorithms:** Integration of cutting-edge algorithms (e.g., ProtoMAML, Reptile).
-* **New Inner Optimizers:** Second-order approximation optimizers and adaptive inner-loop schedulers.
+* **New Meta-Algorithms:** Integration of cutting-edge algorithms (e.g., Siamese, Matching and relational Networks).
 
 ---
 

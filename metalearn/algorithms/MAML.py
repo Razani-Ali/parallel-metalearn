@@ -27,6 +27,18 @@ from metalearn.loss import LabelEncoder
 # MetaSGD can be implemented using same class (per layer learnable lr + only one task)
 # [3] Z. Li, F. Zhou, F. Chen, and H. Li, "Meta-SGD: Learning to Learn 
 #        Quickly for Few-Shot Learning," arXiv preprint arXiv:1707.09835, 2017.
+#
+# [4] ANIL (Almost No Inner Loop):
+#     Raghu, A., Raghu, M., Bengio, S., & Vinyals, O. (2019).
+#     "Rapid Learning or Feature Reuse? Towards Understanding the Effectiveness of MAML."
+#     International Conference on Learning Representations (ICLR), 2020.
+#     arXiv:1909.09157.
+#
+# [5] BOIL (Body Only Inner Loop):
+#     Oh, J., Yoo, H., Kim, C., & Yun, S. Y. (2020).
+#     "BOIL: Towards Representation Change for Few-shot Learning."
+#     International Conference on Learning Representations (ICLR), 2021.
+#     arXiv:2008.08882.
 # ==============================================================================
 
 
@@ -52,7 +64,7 @@ class MAML(MetaOptimizer):
         encoder: LabelEncoder = None,
         inner_steps: int = 1,
         multi_step_loss: bool = False,
-        chunk_size: int = 8,
+        chunk_size: int = 80,
         device: Optional[torch.device] = None,
         **kwargs,
     ):

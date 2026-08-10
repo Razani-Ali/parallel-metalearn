@@ -45,6 +45,7 @@ class MAML_Model(nn.Module):
             fast_weights_names (Optional[Union[List[str], str]]): 
                 - If None: Adapts all trainable parameters (standard MAML).
                 - If "ANIL": Adapts only parameters in the `head` module.
+                - If "BIOL": Adapts only parameters in the `backbone` module.
                 - If List[str]: Adapts specific parameters matching the listed names.
             **kwargs: Additional keyword arguments.
         """
