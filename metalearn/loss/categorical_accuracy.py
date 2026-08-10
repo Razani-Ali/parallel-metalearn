@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
+from .base import BaseMetric
 
 
-class CategoricalAccuracy(nn.Module):
+class CategoricalAccuracy(BaseMetric):
     """
     Vectorized Categorical Accuracy Metric compatible with PyTorch vmap.
     

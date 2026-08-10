@@ -32,3 +32,38 @@ class BaseLoss(nn.Module, ABC):
             Tuple[torch.Tensor, torch.Tensor]: A tuple of (loss, metric), both as scalar Tensors.
         """
         pass
+
+
+class BaseMetric(nn.Module, ABC):
+    """
+    Abstract Base Class for all vectorized metric calculation modules.
+
+    Enforces a standardized forward signature (logits, targets, mask) across custom metrics
+    to guarantee seamless compatibility with BaseLoss, functional_call, and torch.func.vmap.
+    """
+
+    def __init__(self):
+        """Initializes the BaseMetric PyTorch Module and ABC interface."""
+        # Call parent constructors for nn.Module and ABC
+        super().__init__()
+
+    @abstractmethod
+    def forward(
+        self, 
+        logits: torch.Tensor, 
+        targets: torch.Tensor, 
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Abstract method for calculating performance metrics.
+
+        Args:
+            logits (torch.Tensor): Predicted output logits tensor of shape (..., num_classes) or (..., output_dim).
+            targets (torch.Tensor): Ground-truth target tensor of shape (...).
+            mask (Optional[torch.Tensor]): Binary/boolean validity mask tensor for padded/dummy samples.
+
+        Returns:
+            torch.Tensor: Computed scalar metric tensor (or batched tensor under vmap).
+        """
+        # Abstract method body to be implemented by subclass modules
+        pass
