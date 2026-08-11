@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 import torch
 from metalearn.loss.base import BaseLoss
 from .BaseLearner import MetaOptimizer

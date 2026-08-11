@@ -95,7 +95,6 @@ class PrototypicalNetwork(MetaOptimizer):
         # Extract parameters for functional call
         model_states = dict(self.model.named_parameters())
         model_buffers = dict(self.model.named_buffers())
-        all_states = {**model_states, **model_buffers}
 
         def process_single_task(x_s, y_s, x_q, y_q, global_buffers):
             """Core execution logic for a single task."""
@@ -104,7 +103,7 @@ class PrototypicalNetwork(MetaOptimizer):
             combined = {**model_states, **task_buffers}
             (loss, metric), out_dict = self.compute_loss(
                 x_s=x_s, y_s=y_s, x_q=x_q, y_q=y_q, 
-                model_states=all_states, training=training, **kwargs
+                model_states=combined, training=training, **kwargs
             )
             updated_task_buffers = out_dict.get("buffers", task_buffers)
 
@@ -117,7 +116,8 @@ class PrototypicalNetwork(MetaOptimizer):
         )
 
         # Launch parallelized computation
-        meta_losses, metrics, batched_buffers = vectorized_processor(Xsupport, Ysupport, Xquery, Yquery, self.model.named_buffers())
+        meta_losses, metrics, batched_buffers = vectorized_processor(
+            Xsupport, Ysupport, Xquery, Yquery, model_buffers)
 
         # Backpropagation and optimization
         if training:

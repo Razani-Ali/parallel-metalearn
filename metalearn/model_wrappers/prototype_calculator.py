@@ -139,8 +139,10 @@ class SimplePrototype(BasePrototype):
         # Extract training mode flag from kwargs (defaults to True)
         training = kwargs.get('training', True)
 
-        # 1. Generate static one-hot encoding matrix over dataset max_classes spectrum
-        one_hot = F.one_hot(labels, num_classes=self.max_classes).to(features.dtype)
+        # 1. Generate static one-hot encoding matrix via purely out-of-place comparison (vmap-friendly)
+        # 💡 به جای F.one_hot از مقایسه برپخشی استفاده می‌کنیم تا aten::scatter_ فراخوانی نشود
+        class_indices = torch.arange(self.max_classes, device=labels.device)
+        one_hot = (labels.unsqueeze(-1) == class_indices.unsqueeze(0)).to(features.dtype)
 
         # 2. Filter out dummy/padded samples using samples_mask if provided
         if samples_mask is not None:

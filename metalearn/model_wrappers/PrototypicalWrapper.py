@@ -4,6 +4,7 @@ from typing import Dict, Optional, Union
 from .prototype_calculator import SimplePrototype, BasePrototype
 from ..distances.elastics import ElasticDistance
 from ..distances.classics import Euclidean, Distance
+from metalearn.dataset.Scalers import BaseScaler
 
 
 class ProtoNet_Model(nn.Module):
@@ -21,6 +22,7 @@ class ProtoNet_Model(nn.Module):
         max_classes: int,
         distance_module: Optional[Union[Distance, ElasticDistance]] = None,
         drop_rate: float = 0.0,
+        scaler: Optional[BaseScaler] = None,
         prototype_class: Optional[BasePrototype] = None,
         latent_dim: int = None,
     ):
@@ -32,6 +34,7 @@ class ProtoNet_Model(nn.Module):
             max_classes (int): Upper bound on target classes (ways).
             distance_module (nn.Module): Distance computation module (e.g., EuclideanDistance).
             drop_rate (float): Dropout probability.
+            scaler (Optional[nn.Module]): Data Scaler.
             prototype_class (Optional[BasePrototype]): Custom prototype calculator.
             latent_dim (int): Dimensionality of extracted feature vectors.
         """
@@ -42,6 +45,7 @@ class ProtoNet_Model(nn.Module):
         
         self.center_head = prototype_class if prototype_class else SimplePrototype(max_classes=max_classes, latent_dim=latent_dim)
         self.drop_rate = drop_rate
+        self.scaler = scaler
 
         # Register non-persistent buffers for inference deployment
         self.register_buffer("deployed_prototypes", None, persistent=False)
@@ -79,6 +83,9 @@ class ProtoNet_Model(nn.Module):
         # 1. Extract support set features
         if x_s is not None and y_s is not None:
             # Episodic Meta-Learning Mode: Compute dynamic prototypes from support set
+            if self.scaler:
+                x_s = self.scaler(x_s, **kwargs)
+
             feat_s = self.backbone(x_s, **kwargs)
 
             if feat_s.dim() > 2:
@@ -114,6 +121,9 @@ class ProtoNet_Model(nn.Module):
             class_mask = self.deployed_class_mask
 
         # 3. Extract query set features
+        if self.scaler:
+            x_q = self.scaler(x_q, **kwargs)
+
         feat_q = self.backbone(x_q, **kwargs)
 
         if feat_q.dim() > 2:
