@@ -1,12 +1,42 @@
-
-
 # 🚀 Parallel-MetaLearn: Blazing-Fast, VMAP-Powered Functional Meta-Learning for PyTorch
+
+[![PyPI Version](https://img.shields.io/pypi/v/parallel-metalearn?color=blue&logo=pypi&logoColor=white)](https://pypi.org/project/parallel-metalearn/)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/15IULy7fsm93wtwyXdWapBq2seVluySfC?usp=sharing)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Stop writing slow `for` loops over your meta-batches. Stop rewriting your PyTorch models into awkward functional syntax.**
 
-MetaLearn is a next-generation, high-performance meta-learning framework built natively on top of PyTorch 2.0+ `torch.func`. Designed for researchers and production engineers, it delivers **massive speedups** by vectorizing the outer-loop task processing while keeping your code clean, modular, and purely object-oriented.
+MetaLearn is a next-generation, high-performance meta-learning framework built natively on top of PyTorch 2.0+ `torch.func`. Designed for researchers and production engineers, it delivers **massive speedups** by vectorizing outer-loop task processing while keeping your code clean, modular, and purely object-oriented.
 
-Whether you are doing Few-Shot Classification, Domain Adaptation, Semantic Segmentation, or Regression, MetaLearn adapts to your task—not the other way around.
+---
+
+## ⚡ Quick Links & Interactive Demo
+
+* 📦 **PyPI Package:** [`pip install parallel-metalearn`](https://pypi.org/project/parallel-metalearn/)
+* 🚀 **Interactive Google Colab Notebook:** [Try in Google Colab](https://colab.research.google.com/drive/15IULy7fsm93wtwyXdWapBq2seVluySfC?usp=sharing)
+
+> 💡 **Educational Notebook Notice:**  
+> The provided Google Colab notebook is a **demonstration and educational pipeline** designed for fast trial runs on fault diagnosis datasets. The complete core framework and advanced production modules are available in this repository or provided upon request.
+
+---
+
+## 💻 Installation
+
+### Option 1: Install via PyPI (Recommended)
+```bash
+pip install parallel-metalearn
+
+```
+
+### Option 2: Clone for Local Development & Research
+
+```bash
+git clone [https://github.com/your-username/parallel-metalearn.git](https://github.com/your-username/parallel-metalearn.git)
+cd parallel-metalearn
+pip install -e .
+
+```
+
 
 ---
 
@@ -65,7 +95,7 @@ backbone = MyCNNBackbone()
 head = MyLinearHead()
 model = MAML_Model(backbone=backbone, head=head, drop_rate=0.5)
 
-# 2. Setup Class-Agnostic Encoding & Loss
+# 2. Setup Class-Agnostic Encoding & Loss (optional)
 label_encoder = LabelEncoder(num_classes=10, max_n_way=3, shuffle=True)
 loss_fn = CrossEntropy(metric_fn=CategoricalAccuracy())
 
