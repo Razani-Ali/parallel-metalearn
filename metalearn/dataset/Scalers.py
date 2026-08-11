@@ -37,7 +37,7 @@ class BaseScaler(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Applies scaling transformation to the input tensor based on computed statistics.
 
@@ -137,7 +137,7 @@ class RobustScaler(BaseScaler):
 
         return self
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Applies scaling to the input tensor based on fitted median and scale.
 
@@ -216,7 +216,7 @@ class StandardScaler(BaseScaler):
 
         return self
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Applies standard scaling to the input tensor based on fitted mean and std.
 
@@ -290,7 +290,7 @@ class MinMaxScaler(BaseScaler):
 
         return self
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Applies Min-Max scaling to the input tensor based on fitted minimum and maximum.
 

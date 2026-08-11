@@ -142,17 +142,14 @@ class ProtoMAMLv2(MetaOptimizer):
         static_params: Dict[str, torch.Tensor], 
         buffers: Dict[str, torch.Tensor], 
         x_s: torch.Tensor, 
-        y_s: Dict[str, torch.Tensor], 
+        y_s: Dict[str, torch.Tensor],
+        inner_step: int = 0,
+        training: bool = False,
         **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Calculates support loss. Dynamically constructs prototype head weights 
         BEFORE calculating the loss to ensure complete autograd tracking.
-
-        Args:
-            fast_weights (Dict): Current backbone parameters.
-            x_s (torch.Tensor): Support set features.
-            y_s (Dict): Support set targets.
 
         Returns:
             torch.Tensor: Evaluated support loss.
@@ -165,8 +162,12 @@ class ProtoMAMLv2(MetaOptimizer):
         combined_params = {**proto_weights, **static_params, **buffers}
         
         # 3. Evaluate support loss through the newly generated parameters
-        loss, _ = self.compute_loss(
-            X=x_s, Y=y_s, model_states=combined_params, loss_module=self.support_loss_fn, **kwargs
+        (loss, _), _ = self.compute_loss(
+            X=x_s, Y=y_s, model_states=combined_params,
+            loss_module=self.support_loss_fn,
+            inner_step=inner_step,
+            training=training,
+            **kwargs
         )
         
         # Return scalar loss tensor linked to the backbone via prototypes
@@ -178,20 +179,22 @@ class ProtoMAMLv2(MetaOptimizer):
         X: torch.Tensor, 
         Y: Dict[str, torch.Tensor], 
         model_states: Dict[str, torch.Tensor], 
-        loss_module: BaseLoss, 
+        loss_module: BaseLoss,
+        inner_step: int = 0,
+        training: bool = False,
         **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Executes functional forward pass and computes metric evaluations.
         """
         # Extract isolated kwargs required for the forward pass
-        forward_kwargs = kwargs.get("kwargs_to_forward", {})
+        forward_kwargs = {"training": training, "num_step": inner_step}
         
         # Trigger stateless functional execution
         out_dict = torch.func.functional_call(self.model, model_states, (X,), forward_kwargs)
         
         # Return loss and performance metrics
-        return loss_module(out_dict=out_dict, targets=Y, model_states=model_states, **kwargs)
+        return loss_module(out_dict=out_dict, targets=Y, model_states=model_states, **kwargs), out_dict
 
     # =========================================================================
     # Training Step
@@ -228,8 +231,9 @@ class ProtoMAMLv2(MetaOptimizer):
         # Retrieve static parameters and strictly backbone fast weights
         static_params, all_buffers, initial_fast_weights = self._extract_model_states()
 
-        def process_single_task(x_s, y_s, x_q, y_q):
+        def process_single_task(x_s, y_s, x_q, y_q, global_buffers):
             """Internal closure defining per-task execution logic."""
+            task_buffers = {k: v.clone() for k, v in global_buffers.items()}
             # Initialize fast weights (Backbone ONLY)
             fast_weights = OrderedDict(initial_fast_weights)
             # Initialize inner optimizer states
@@ -242,7 +246,7 @@ class ProtoMAMLv2(MetaOptimizer):
                 # 1. Compute gradients for backbone. 
                 # (Head is dynamically computed inside inner_step_fn before loss eval)
                 grads = self.inner_step_fn(
-                    fast_weights, static_params, all_buffers,
+                    fast_weights, static_params, task_buffers,
                     x_s, y_s, inner_step=inner_step,
                     training=True, **kwargs
                 )
@@ -258,10 +262,10 @@ class ProtoMAMLv2(MetaOptimizer):
                 if self.multi_step_loss and not last_step:
                     # Dynamically calculate prototypes using the intermediately adapted backbone
                     proto_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights)
-                    combined = {**proto_weights, **static_params, **all_buffers}
+                    combined = {**proto_weights, **static_params, **task_buffers}
                     
                     # Evaluate query loss
-                    q_step_loss, _ = self.compute_loss(
+                    (q_step_loss, _), _ = self.compute_loss(
                         X=x_q, Y=y_q, model_states=combined,
                         loss_module=self.query_loss_fn, inner_step=inner_step,
                         training=True, **kwargs
@@ -271,10 +275,10 @@ class ProtoMAMLv2(MetaOptimizer):
             # FINAL QUERY EVALUATION
             # Recompute prototype head weights using the fully adapted backbone
             proto_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights)
-            combined = {**proto_weights, **static_params, **all_buffers}
+            combined = {**proto_weights, **static_params, **task_buffers}
             
             # Evaluate final meta-objective
-            q_step_loss, q_metric = self.compute_loss(
+            (q_step_loss, q_metric), out_dict = self.compute_loss(
                 X=x_q, Y=y_q, model_states=combined,
                 loss_module=self.query_loss_fn,
                 inner_step=self.num_inner_steps,
@@ -286,17 +290,19 @@ class ProtoMAMLv2(MetaOptimizer):
             meta_loss = self._update_meta_loss(meta_loss, q_step_loss, target_step_idx)
 
             # Return scalar loss and metric for task
-            return meta_loss, q_metric
+            updated_task_buffers = out_dict.get("buffers", task_buffers)
+
+            return meta_loss, q_metric, updated_task_buffers
 
         # Vectorize execution over batch dimension
         vectorized_processor = vmap(
-            process_single_task, in_dims=(0, 0, 0, 0),
+            process_single_task, in_dims=(0, 0, 0, 0, None),
             randomness="different", chunk_size=self.chunk_size
         )
 
         # Launch parallelized computation
-        meta_losses, metrics = vectorized_processor(
-            Xsupport, Ysupport, Xquery, Yquery
+        meta_losses, metrics, batched_buffers = vectorized_processor(
+            Xsupport, Ysupport, Xquery, Yquery, all_buffers
         )
 
         # Compute outer gradients and optimize meta-parameters
@@ -304,6 +310,11 @@ class ProtoMAMLv2(MetaOptimizer):
             self.optimizer.zero_grad()
             meta_losses.mean().backward()
             self.optimizer.step()
+            with torch.no_grad():
+                for name, buffer_tensor in self.model.named_buffers():
+                    if name in batched_buffers:
+                        mean_buf = batched_buffers[name].mean(dim=0)
+                        buffer_tensor.copy_(mean_buf)
 
         # Return mean values for logging
         return (
@@ -316,38 +327,64 @@ class ProtoMAMLv2(MetaOptimizer):
     # =========================================================================
     def adapt_and_update(self, Xsupport: torch.Tensor, Ysupport: Dict[str, torch.Tensor], **kwargs) -> None:
         """
-        Adapts backbone parameters to the support set and permanently binds 
-        the computed prototypes as the final inference classification head.
+        Adapts backbone parameters to the support set and permanently binds the computed 
+        prototypes and updated buffers for ProtoMAML v2.
         """
-        # Retrieve strictly backbone initial parameters
+        Xsupport = Xsupport.to(self.device)
+        Ysupport = {
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+            for k, v in Ysupport.items()
+        }
+
         static_params, all_buffers, initial_fast_weights = self._extract_model_states()
 
-        def _adapt_single_task(x_s, y_s):
-            # Adapt Backbone via SGD
+        def _adapt_single_task(x_s, y_s, global_buffers):
+            task_buffers = {k: v.clone() for k, v in global_buffers.items()}
             fast_weights = OrderedDict(initial_fast_weights)
             opt_state = self.inner_optimizer.init_state(fast_weights)
-            
+
+            # Adapt Backbone parameters ONLY via Inner Optimizer
             for inner_step in range(self.num_inner_steps):
                 grads = self.inner_step_fn(
-                    fast_weights, static_params, all_buffers, x_s, y_s, inner_step=inner_step, training=False, **kwargs
+                    fast_weights, static_params, task_buffers, 
+                    x_s, y_s, inner_step=inner_step, training=False, **kwargs
                 )
                 fast_weights, opt_state = self.inner_optimizer(
                     fast_weights=fast_weights, gradients=grads, state=opt_state, step=inner_step
                 )
-            
-            # After full backbone adaptation, compute final deterministic prototype head
-            final_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights)
-            return final_weights
 
-        # Vectorize adaptation 
-        vectorized_adapt = vmap(_adapt_single_task, in_dims=(0, 0), chunk_size=self.chunk_size)
-        fast_weights_batched = vectorized_adapt(Xsupport.to(self.device), Ysupport.to(self.device))
+            # Calculate final deterministic prototype head weights using adapted backbone
+            final_weights = self.model.initialize_head_weights(
+                x_s, y_s, fast_weights, inner_step=self.num_inner_steps - 1, training=False, **kwargs
+            )
 
-        # Permanently inject adapted backbone and computed head back to base model
+            # Capture updated task buffers
+            combined = {**final_weights, **static_params, **task_buffers}
+            _, out_dict = self.compute_loss(
+                X=x_s, Y=y_s, model_states=combined,
+                loss_module=self.support_loss_fn,
+                inner_step=self.num_inner_steps,
+                training=False, **kwargs
+            )
+            updated_task_buffers = out_dict.get("buffers", task_buffers)
+
+            return final_weights, updated_task_buffers
+
+        # Vectorize task adaptation
+        vectorized_adapt = vmap(_adapt_single_task, in_dims=(0, 0, None), chunk_size=self.chunk_size)
+        fast_weights_batched, batched_buffers = vectorized_adapt(Xsupport, Ysupport, all_buffers)
+
+        # Copy adapted backbone parameters, prototype head, and buffers back to model
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if name in fast_weights_batched:
                     param.copy_(fast_weights_batched[name].mean(dim=0))
+
+            for name, buffer_tensor in self.model.named_buffers():
+                if name in batched_buffers:
+                    buffer_tensor.copy_(batched_buffers[name].mean(dim=0))
+
+        print("✅ ProtoMAML v2: Backbone, prototype head, and buffers successfully adapted and updated.")
 
     def _init_step_weights(self, num_inner_steps: int, training: bool, **kwargs) -> None:
         """Calculates multi-step loss scalar weights."""

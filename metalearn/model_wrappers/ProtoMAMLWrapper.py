@@ -56,7 +56,7 @@ class ProtoMAML_Model(nn.Module):
         # Initialize standard linear head (overwritten dynamically during functional execution)
         self.head = nn.Linear(latent_dim, max_classes)
         # Initialize regularization dropout layer
-        self.dropout = nn.Dropout(p=drop_rate)
+        self.drop_rate = drop_rate
 
         # Initialize Fast Weights
         self.fast_weights = fast_weights_names
@@ -65,7 +65,10 @@ class ProtoMAML_Model(nn.Module):
         self, 
         x_s: torch.Tensor, 
         y_s: Dict[str, torch.Tensor], 
-        current_fast_weights: Dict[str, torch.Tensor]
+        current_fast_weights: Dict[str, torch.Tensor],
+        inner_step: int = 0,
+        training: bool = False,
+        **kwargs
     ) -> Dict[str, torch.Tensor]:
         """
         Calculates ProtoMAML initialization for the classification head (W^(0), b^(0))
@@ -76,6 +79,8 @@ class ProtoMAML_Model(nn.Module):
             x_s (torch.Tensor): Support set input feature tensor.
             y_s (Dict[str, torch.Tensor]): Target dictionary containing 'labels' and optional 'samples_mask'.
             current_fast_weights (Dict[str, torch.Tensor]): Current fast weights dictionary.
+            inner_step (int): current inner gradient step
+            training (bool): whether if you train or validate a model
 
         Returns:
             Dict[str, torch.Tensor]: Updated fast weights dictionary with prototype-initialized head.
@@ -86,12 +91,14 @@ class ProtoMAML_Model(nn.Module):
             for k, v in current_fast_weights.items() 
             if k.startswith("backbone.")
         }
+
+        forward_kwargs = {"training": training, "num_step": inner_step}
         
         # 2. Extract support features using functional_call over current backbone weights
         if self.scaler:
             x_s = self.scaler(x_s)
 
-        features = torch.func.functional_call(self.backbone, backbone_params, (x_s,))
+        features = torch.func.functional_call(self.backbone, backbone_params, (x_s,), forward_kwargs)
 
         # 3. Extract target labels and optional samples validity mask from target dict
         labels = y_s["labels"]
@@ -118,29 +125,44 @@ class ProtoMAML_Model(nn.Module):
         # Return updated fast weights containing prototype-based head parameters
         return proto_weights
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
         """
         Standard parameter-free forward pass evaluating classification logits.
 
         Args:
             x (torch.Tensor): Input tensor.
+            **kwargs: Operational flags such as 'inner_step' and 'training'.
 
         Returns:
             Dict[str, torch.Tensor]: Output dictionary containing 'logits' and 'features'.
         """
         # Pass inputs through feature extraction backbone
         if self.scaler:
-            x = self.scaler(x)
+            x = self.scaler(x, **kwargs)
             
-        features = self.backbone(x)
-        features = self.dropout(features)
+        features = self.backbone(x, **kwargs)
+        dropout_training = kwargs.get('training', self.training)
+
+        if features.dim() > 2:
+            features_flat = features.flatten(start_dim=-1)
+        else:
+            features_flat = features
+
+        features_flat = torch.nn.functional.dropout(
+            features_flat, 
+            p=self.drop_rate, 
+            training=dropout_training
+        )
+
         # Evaluate logits via classification linear head
-        logits = self.head(features)
+        logits = self.head(features_flat)
 
         # Return formatted prediction dictionary
+        current_buffers = dict(self.named_buffers())
         return {
             "logits": logits,
-            "features": features
+            "features": features,
+            "buffers": current_buffers
         }
 
     def get_fast_weights(self, **kwargs) -> OrderedDict:

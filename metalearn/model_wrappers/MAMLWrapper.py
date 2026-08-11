@@ -64,7 +64,7 @@ class MAML_Model(nn.Module):
 
         Args:
             x (torch.Tensor): Input feature/image batch tensor.
-            **kwargs: Operational flags such as 'return_features' or 'training'.
+            **kwargs: Operational flags such as 'inner_step' and 'training'.
 
         Returns:
             Union[torch.Tensor, Dict[str, torch.Tensor]]: 
@@ -72,8 +72,8 @@ class MAML_Model(nn.Module):
         """
         # 1. Forward pass through backbone feature extractor
         if self.scaler:
-            x = self.scaler(x)
-        features = self.backbone(x)
+            x = self.scaler(x, **kwargs)
+        features = self.backbone(x, **kwargs)
 
         # 2. Apply dropout regularizer prior to classification head
         dropout_training = kwargs.get('training', self.training)
@@ -90,10 +90,11 @@ class MAML_Model(nn.Module):
         )
 
         # 3. Compute final logits through head module
-        logits = self.head(features_flat)
+        logits = self.head(features_flat, **kwargs)
 
         # Return standardized output dictionary
-        return {"logits": logits, "features": features}
+        current_buffers = dict(self.named_buffers())
+        return {"logits": logits, "features": features, "buffers": current_buffers}
 
     def get_fast_weights(self, **kwargs) -> OrderedDict:
         """

@@ -114,7 +114,7 @@ class Reptile(MetaOptimizer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Computes support loss for a single inner-step adaptation."""
         combined_params = {**fast_weights, **static_params, **buffers}
-        loss, _ = self.compute_loss(
+        (loss, _), _ = self.compute_loss(
             X=x_s, Y=y_s, model_states=combined_params, loss_module=self.support_loss_fn, **kwargs
         )
         return loss
@@ -131,7 +131,7 @@ class Reptile(MetaOptimizer):
         """Performs functional forward pass and computes evaluation metrics."""
         forward_kwargs = kwargs.get("kwargs_to_forward", {})
         out_dict = torch.func.functional_call(self.model, model_states, (X,), forward_kwargs)
-        return loss_module(out_dict=out_dict, targets=Y, model_states=model_states, **kwargs)
+        return loss_module(out_dict=out_dict, targets=Y, model_states=model_states, **kwargs), out_dict
 
     # =========================================================================
     # 1. Main Training/Evaluation Step 
@@ -163,8 +163,9 @@ class Reptile(MetaOptimizer):
 
         static_params, all_buffers, initial_fast_weights = self._extract_model_states()
 
-        def process_single_task(x_s, y_s, x_q, y_q):
+        def process_single_task(x_s, y_s, x_q, y_q, global_buffers):
             """Core execution loop for a single task within vmap."""
+            task_buffers = {k: v.clone() for k, v in global_buffers.items()}
             fast_weights = OrderedDict(initial_fast_weights)
             opt_state = self.inner_optimizer.init_state(fast_weights)
 
@@ -177,7 +178,7 @@ class Reptile(MetaOptimizer):
             # 1. Execute inner adaptation steps (Standard SGD towards task manifold)
             for inner_step in range(self.num_inner_steps):
                 grads = self.inner_step_fn(
-                    fast_weights, static_params, all_buffers,
+                    fast_weights, static_params, task_buffers,
                     x_s, y_s, inner_step=inner_step,
                     training=True, **kwargs
                 )
@@ -191,25 +192,27 @@ class Reptile(MetaOptimizer):
             param_deltas = pytree.tree_map(lambda w_new, w_old: w_new - w_old, fast_weights, initial_fast_weights)
 
             # 3. Final Query Evaluation (For logging/metrics only)
-            combined = {**fast_weights, **static_params, **all_buffers}
-            q_loss, q_metric = self.compute_loss(
+            combined = {**fast_weights, **static_params, **task_buffers}
+            (q_loss, q_metric), out_dict = self.compute_loss(
                 X=x_q, Y=y_q, model_states=combined,
                 loss_module=self.query_loss_fn,
                 inner_step=self.num_inner_steps,
                 training=training, **kwargs
             )
 
-            return param_deltas, q_loss, q_metric
+            updated_task_buffers = out_dict.get("buffers", task_buffers)
+
+            return param_deltas, q_loss, q_metric, updated_task_buffers
 
         # Parallelize single task processing across the task batch using vmap
         vectorized_processor = vmap(
-            process_single_task, in_dims=(0, 0, 0, 0),
+            process_single_task, in_dims=(0, 0, 0, 0, None),
             randomness="different", chunk_size=self.chunk_size
         )
 
         # Retrieve vectorized weight deltas and query metrics
-        vectorized_deltas, query_losses, query_metrics = vectorized_processor(
-            Xsupport, Ysupport, Xquery, Yquery
+        vectorized_deltas, query_losses, query_metrics, batched_buffers = vectorized_processor(
+            Xsupport, Ysupport, Xquery, Yquery, all_buffers
         )
 
         # Outer loop meta-optimization step (First-Order Injection)
@@ -227,6 +230,12 @@ class Reptile(MetaOptimizer):
             
             self.optimizer.step()
 
+            with torch.no_grad():
+                for name, buffer_tensor in self.model.named_buffers():
+                    if name in batched_buffers:
+                        mean_buf = batched_buffers[name].mean(dim=0)
+                        buffer_tensor.copy_(mean_buf)
+
         return query_losses.mean().item(), query_metrics.mean().item()
 
     # =========================================================================
@@ -234,31 +243,85 @@ class Reptile(MetaOptimizer):
     # =========================================================================
     def adapt_and_update(self, Xsupport: torch.Tensor, Ysupport: Dict[str, torch.Tensor], **kwargs) -> None:
         """
-        Adapts parameters on the provided support set and permanently updates `self.model`.
-        Intended exclusively for test-time adaptation or deployment.
+        Adapts parameters and buffers on the provided support set and permanently updates `self.model`.
+        Intended exclusively for test-time adaptation or deployment in Reptile.
+
+        Args:
+            Xsupport (torch.Tensor): Support set inputs tensor of shape (num_tasks, K, ...).
+            Ysupport (Dict[str, torch.Tensor]): Support set target dictionary containing labels/masks.
+            **kwargs: Operational arguments passed down to loss modules and model forward pass.
         """
+        # Helper function to recursively transfer tensors or dictionaries to target compute device
+        def to_device(obj, device):
+            if isinstance(obj, torch.Tensor):
+                return obj.to(device)
+            elif isinstance(obj, dict):
+                return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in obj.items()}
+            return obj
+
+        # Transfer support dataset inputs and labels to the designated device
+        Xsupport = to_device(Xsupport, self.device)
+        Ysupport = to_device(Ysupport, self.device)
+
+        # Extract current model state split into static parameters, persistent buffers, and initial fast weights
         static_params, all_buffers, initial_fast_weights = self._extract_model_states()
 
-        def _adapt_single_task(x_s, y_s):
-            """Performs inner-loop adaptation for a single task."""
+        # Define single-task adaptation closure compatible with torch.func.vmap
+        def _adapt_single_task(x_s, y_s, global_buffers):
+            # Create an isolated clone of model buffers for this specific task to enable vmap parallelization
+            task_buffers = {k: v.clone() for k, v in global_buffers.items()}
+            
+            # Initialize task-specific fast weights dictionary
             fast_weights = OrderedDict(initial_fast_weights)
+            
+            # Initialize task-specific inner optimizer state
             opt_state = self.inner_optimizer.init_state(fast_weights)
             
+            # Execute inner adaptation steps using standard SGD/inner optimizer towards task manifold
             for inner_step in range(self.num_inner_steps):
+                # Compute support gradients using first-order autograd
                 grads = self.inner_step_fn(
-                    fast_weights, static_params, all_buffers, x_s, y_s, inner_step=inner_step, training=False, **kwargs
+                    fast_weights, static_params, task_buffers, 
+                    x_s, y_s, inner_step=inner_step, training=True, **kwargs
                 )
+                # Update task-specific fast weights via the inner optimizer
                 fast_weights, opt_state = self.inner_optimizer(
                     fast_weights=fast_weights, gradients=grads, state=opt_state, step=inner_step
                 )
-            return fast_weights
 
-        # Vectorize task adaptation across the task batch dimension
-        vectorized_adapt = vmap(_adapt_single_task, in_dims=(0, 0), chunk_size=self.chunk_size)
-        fast_weights_batched = vectorized_adapt(Xsupport.to(self.device), Ysupport.to(self.device))
+            # Combine adapted fast weights with static parameters and updated task buffers
+            combined = {**fast_weights, **static_params, **task_buffers}
+            
+            # Execute final functional pass to capture updated task buffers (e.g., BatchNorm, running_prototypes)
+            _, out_dict = self.compute_loss(
+                X=x_s, Y=y_s, model_states=combined,
+                loss_module=self.support_loss_fn,
+                inner_step=self.num_inner_steps,
+                training=False, **kwargs
+            )
+            
+            # Extract updated buffers dictionary from forward output, falling back to task_buffers if empty
+            updated_task_buffers = out_dict.get("buffers", task_buffers)
 
-        # Permanently copy adapted weights back to base model parameters (averaged across tasks)
+            # Return adapted weights and updated task buffers for batch aggregation
+            return fast_weights, updated_task_buffers
+
+        # Vectorize single-task adaptation execution across the task batch dimension
+        vectorized_adapt = vmap(_adapt_single_task, in_dims=(0, 0, None), chunk_size=self.chunk_size)
+        
+        # Execute vectorized adaptation across all support tasks simultaneously
+        fast_weights_batched, batched_buffers = vectorized_adapt(Xsupport, Ysupport, all_buffers)
+
+        # Permanently copy adapted parameters and task-averaged buffers back to the base model
         with torch.no_grad():
+            # Update trainable model parameters with mean adapted values across tasks
             for name, param in self.model.named_parameters():
                 if name in fast_weights_batched:
                     param.copy_(fast_weights_batched[name].mean(dim=0))
+
+            # Update persistent model buffers with mean updated values across tasks
+            for name, buffer_tensor in self.model.named_buffers():
+                if name in batched_buffers:
+                    buffer_tensor.copy_(batched_buffers[name].mean(dim=0))
+
+        print("✅ Reptile: Model parameters and running buffers successfully adapted and updated.")
