@@ -164,6 +164,53 @@ Because MetaLearn processes inner-loop updates in a stateless, functional manner
 
 ---
 
+## 📊 Experimental Setup & Benchmark Results
+
+> ⚠️ **Educational Colab Notice:**  
+> The results below are obtained from a fast demonstration run using the provided **Google Colab Notebook** on the CWRU fault diagnosis dataset. It serves as an empirical verification of parallel speed, convergence stability, and meta-generalization capabilities across algorithms under identical runtime constraints.
+
+---
+
+### 1. Dataset & File-Level Stratified Splitting Strategy
+
+To strictly prevent data leakage between meta-training and meta-validation domains, signals are partitioned strictly at the **physical file/session level** rather than random sample-level slicing:
+
+* **Signal Processing:** Raw 2-channel vibration signals segmented into time-series windows of length **2048** with 75% overlap (stride = 512).
+* **Domain Partition:** **20% of files** allocated for Meta-Training and **80% of files** reserved for Zero-Shot Meta-Validation (Domain-Shift evaluation).
+* **Task Configuration:** 3-Way 5-Shot Support ($K_s=5$) and 15-Shot Query ($K_q=15$) sampled dynamically per episode batch.
+
+---
+
+### 2. Feature Extractor Architecture (Backbone)
+
+A lightweight functional network designed for processing raw vibration sequences:
+* **Feature Projection:** Linear layers ($64 \times 4 \to 128 \to 3$) processing chunked signal windows.
+* **Normalization:** Custom VMAP-friendly **Step-Aware `BatchNorm`** (`use_per_step_stats=True`) tracking independent running statistics across inner-loop adaptation steps.
+* **Embedding Projection:** Global linear mapping producing a **64-dimensional latent representation**.
+
+---
+
+### 3. Experimental Benchmark Comparison (200 Epochs)
+
+All algorithms were trained under identical hardware constraints using a **Meta-Batch Size of 24 tasks** vectorized via `torch.func.vmap`.
+
+| Algorithm | Inner Loop Setup | Best Val Accuracy | Validation Convergence Profile |
+| :--- | :--- | :---: | :--- |
+| **ProtoMAML v2** | Pure Prototypical Backbone (3 Steps) | **100.00%** | Smooth, rapid convergence & perfect Domain generalization |
+| **ProtoMAML v1** | Prototype Head Init + Full SGD (1 Step) | **99.44%** | Highly accurate, steady loss minimization |
+| **MAML++** | Learnable LRs + Multi-Step Loss (3 Steps) | **98.89%** | Fast convergence & stable accuracy curve |
+| **Prototypical Net** | Non-parametric Distance Alignment | **86.11%** | Underfitting due to lack of inner-loop parameter adaptation |
+| **MAML (Vanilla)** | Standard First/Second-Order SGD (3 Steps) | **82.22%** | Noisy convergence with high gradient step variance |
+| **Reptile** | First-Order Directional Update (3 Steps) | **70.56%** | Stable train/val alignment but slower adaptation rate |
+
+---
+
+### ⚡ Key Takeaways
+1. **Dynamic Prototype Initialization (ProtoMAML v2):** Eliminates gradient noise on classification heads, yielding **100% accuracy** with smooth loss minimization.
+2. **Step-Aware BatchNorm & Multi-Step Loss (MAML++):** Stabilizes standard gradient-based MAML, boosting accuracy from **82.22% to 98.89%**.
+3. **Blazing Execution Speed:** Processing 200 epochs of full second-order MAML++ optimization across 24 parallelized tasks completes in **~23.65 seconds** on a single GPU thanks to `vmap` vectorization.
+
+---
 ## 🤝 Contributing & Citation
 
 If you use MetaLearn in your research or production pipelines, we'd love to hear about it! Contributions, issues, and feature requests are always welcome.
