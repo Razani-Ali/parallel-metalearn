@@ -51,7 +51,7 @@ class ProtoMAML_Model(nn.Module):
         self.backbone = backbone
         
         # Instantiate non-parametric class center calculator
-        self.center_head = prototype_class if prototype_class else SimplePrototype(max_classes=max_classes)
+        self.center_head = prototype_class if prototype_class else SimplePrototype(max_classes=max_classes, latent_dim=latent_dim)
         
         # Initialize standard linear head (overwritten dynamically during functional execution)
         self.head = nn.Linear(latent_dim, max_classes)

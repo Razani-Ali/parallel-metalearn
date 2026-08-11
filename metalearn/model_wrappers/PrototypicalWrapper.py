@@ -22,6 +22,7 @@ class ProtoNet_Model(nn.Module):
         distance_module: Optional[Union[Distance, ElasticDistance]] = None,
         drop_rate: float = 0.0,
         prototype_class: Optional[BasePrototype] = None,
+        latent_dim: int = None,
     ):
         """
         Initializes the ProtoNet_Model wrapper.
@@ -32,13 +33,14 @@ class ProtoNet_Model(nn.Module):
             distance_module (nn.Module): Distance computation module (e.g., EuclideanDistance).
             drop_rate (float): Dropout probability.
             prototype_class (Optional[BasePrototype]): Custom prototype calculator.
+            latent_dim (int): Dimensionality of extracted feature vectors.
         """
         super().__init__()
         self.backbone = backbone
         self.max_classes = max_classes
         self.distance_module = distance_module if distance_module else Euclidean()
         
-        self.center_head = prototype_class if prototype_class else SimplePrototype(max_classes=max_classes)
+        self.center_head = prototype_class if prototype_class else SimplePrototype(max_classes=max_classes, latent_dim=latent_dim)
         self.drop_rate = drop_rate
 
         # Register non-persistent buffers for inference deployment
