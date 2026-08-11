@@ -266,7 +266,8 @@ class MAML(MetaOptimizer):
             )
             
             # Extract updated buffers dictionary from forward output, falling back to task_buffers if empty
-            updated_task_buffers = out_dict.get("buffers", task_buffers)
+            raw_buffers = out_dict.get("buffers", task_buffers)
+            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
             # Return adapted weights and updated task buffers for batch aggregation
             return fast_weights, updated_task_buffers
@@ -383,7 +384,8 @@ class MAML(MetaOptimizer):
             target_step_idx = max(0, self.num_inner_steps - 1)
             meta_loss = self._update_meta_loss(meta_loss, q_step_loss, target_step_idx)
 
-            updated_task_buffers = out_dict.get("buffers", task_buffers)
+            raw_buffers = out_dict.get("buffers", task_buffers)
+            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
             return meta_loss, q_metric, updated_task_buffers
 

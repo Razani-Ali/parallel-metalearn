@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 from abc import ABC, abstractmethod
 
 
@@ -21,8 +20,11 @@ class BasePrototype(nn.Module, ABC):
             max_classes (int): Upper bound on total target classes (ways) per task batch.
             detach_prototypes (bool): Whether to detach computed prototypes from autograd graph.
         """
+        # Call parent nn.Module constructor
         super().__init__()
+        # Store maximum capacity of target classes
         self.max_classes = max_classes
+        # Store flag for detaching prototypes from autograd computational graph
         self.detach_prototypes = detach_prototypes
 
     @abstractmethod
@@ -30,22 +32,14 @@ class BasePrototype(nn.Module, ABC):
         self, 
         features: torch.Tensor, 
         labels: torch.Tensor,
-        samples_mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        samples_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Abstract method for computing class centroids/prototypes.
-
-        Args:
-            features (torch.Tensor): Extracted sample representations of shape [num_samples, latent_dim].
-            labels (torch.Tensor): Ground-truth class index tensor of shape [num_samples].
-            samples_mask (Optional[torch.Tensor]): Binary validity mask tensor for padded samples.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - centroids: Mean feature representations of shape [max_classes, latent_dim].
-                - mask: Boolean tensor of shape [max_classes] indicating active classes.
         """
         pass
+
 
 class SimplePrototype(BasePrototype):
     """
@@ -53,11 +47,13 @@ class SimplePrototype(BasePrototype):
 
     Computes class centers (prototypes) across feature tensors using vectorized matrix
     operations while respecting sample validity masks (samples_mask). Fully differentiable
-    and compatible with PyTorch `vmap`, `functional_call`, and MAML execution loops.
+    and compatible with PyTorch `torch.func.vmap`, `functional_call`, and MAML execution loops.
 
     Optionally maintains exponential moving averages (`running_prototypes`) per inner adaptation 
     step when `keep_running_Prototype=True` and `use_per_step_stats=True`, properly avoiding 
     zero-bias on newly initialized classes and correctly ignoring masked out samples.
+    Purely functional: returns updated buffer states in a dictionary without modifying 
+    `self` in-place, eliminating `vmap` tensor escape errors.
     """
 
     def __init__(
@@ -82,36 +78,54 @@ class SimplePrototype(BasePrototype):
             momentum (float): Momentum factor for exponential moving average updates.
             detach_prototypes (bool): Whether to detach output prototypes from computational graph.
         """
-        # Initialize PyTorch parent module
+        # Initialize base prototype abstract parent class
         super().__init__(max_classes=max_classes, detach_prototypes=detach_prototypes)
         
-        # Store configuration parameters
+        # Store latent dimensionality of input feature embeddings
         self.latent_dim = latent_dim
+        # Store boolean flag enabling exponential moving average tracking for prototypes
         self.keep_running_Prototype = keep_running_Prototype
+        # Store boolean flag enabling step-specific prototype buffers (for MAML++)
         self.use_per_step_stats = use_per_step_stats
+        # Store maximum inner-loop step count threshold
         self.max_inner_steps = max_inner_steps
+        # Store exponential smoothing momentum factor
         self.momentum = momentum
 
-        # Register persistent buffers if running prototype tracking is enabled
+        # Register state buffers if prototype moving average tracking is enabled
         if self.keep_running_Prototype:
             if self.use_per_step_stats:
-                # Register 3D buffer to store running feature prototypes per inner step [max_inner_steps, max_classes, latent_dim]
-                self.register_buffer("running_prototypes", torch.zeros(max_inner_steps, max_classes, latent_dim))
-                # Register 2D boolean buffer tracking class initialization per inner step [max_inner_steps, max_classes]
-                self.register_buffer("initialized_classes", torch.zeros(max_inner_steps, max_classes, dtype=torch.bool))
+                # Register 3D persistent buffer: [max_inner_steps, max_classes, latent_dim]
+                self.register_buffer(
+                    "running_prototypes", 
+                    torch.zeros(max_inner_steps, max_classes, latent_dim)
+                )
+                # Register 2D boolean initialization tracker: [max_inner_steps, max_classes]
+                self.register_buffer(
+                    "initialized_classes", 
+                    torch.zeros(max_inner_steps, max_classes, dtype=torch.bool)
+                )
             else:
-                # Register 2D buffer to store running feature prototypes [max_classes, latent_dim]
-                self.register_buffer("running_prototypes", torch.zeros(max_classes, latent_dim))
-                # Register 1D boolean buffer tracking initialized classes [max_classes]
-                self.register_buffer("initialized_classes", torch.zeros(max_classes, dtype=torch.bool))
+                # Register 2D persistent buffer: [max_classes, latent_dim]
+                self.register_buffer(
+                    "running_prototypes", 
+                    torch.zeros(max_classes, latent_dim)
+                )
+                # Register 1D boolean initialization tracker: [max_classes]
+                self.register_buffer(
+                    "initialized_classes", 
+                    torch.zeros(max_classes, dtype=torch.bool)
+                )
 
     def compute_class_centers(
         self, 
         features: torch.Tensor, 
         labels: torch.Tensor,
         samples_mask: Optional[torch.Tensor] = None,
+        task_buffers: Optional[Dict[str, torch.Tensor]] = None,
+        prefix: str = "center_head.",
         **kwargs
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Calculates mean feature centroids and active class presence masks while 
         ignoring padded/dummy samples via samples_mask. Fully tracks gradients.
@@ -120,108 +134,135 @@ class SimplePrototype(BasePrototype):
             features (torch.Tensor): Extracted sample representations of shape [num_samples, latent_dim].
             labels (torch.Tensor): Ground-truth class index tensor of shape [num_samples].
             samples_mask (Optional[torch.Tensor]): Binary/boolean validity mask of shape [num_samples].
+            task_buffers (Optional[Dict[str, torch.Tensor]]): Current task state buffers dictionary.
+            prefix (str): Buffer key name prefix for model state mapping.
             **kwargs: Operational context flags such as 'inner_step' and 'training'.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
+            Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
                 - centroids: Mean feature representations of shape [max_classes, latent_dim].
                 - mask: Boolean tensor of shape [max_classes] indicating active classes.
+                - updated_buffers: Dictionary containing state buffers updated purely out-of-place.
         """
         # Extract adaptation inner-step index from context dictionary (defaults to step 0)
         num_step = kwargs.get('inner_step', 0)
+        
+        # Ensure step index is represented as a Tensor on the target compute device
         if isinstance(num_step, int):
             num_step = torch.tensor(num_step, device=features.device)
-            # Clamp index to maximum inner steps boundary to avoid tensor indexing out-of-bounds
+            # Clamp index to maximum inner steps boundary to prevent indexing out-of-bounds
             step_idx = torch.clamp(num_step, max=self.max_inner_steps - 1)
         else:
             step_idx = num_step
 
-        # Extract training mode flag from kwargs (defaults to True)
+        # Extract training mode boolean flag from context dictionary (defaults to True)
         training = kwargs.get('training', True)
 
-        # 1. Generate static one-hot encoding matrix via purely out-of-place comparison (vmap-friendly)
-        # 💡 به جای F.one_hot از مقایسه برپخشی استفاده می‌کنیم تا aten::scatter_ فراخوانی نشود
+        # Generate class index tensor spanning full max_classes range: [max_classes]
         class_indices = torch.arange(self.max_classes, device=labels.device)
+        
+        # Generate static one-hot encoding matrix via pure out-of-place equality broadcast to avoid aten::scatter_
         one_hot = (labels.unsqueeze(-1) == class_indices.unsqueeze(0)).to(features.dtype)
 
-        # 2. Filter out dummy/padded samples using samples_mask if provided
+        # Filter out invalid/padded dummy samples using samples_mask if provided
         if samples_mask is not None:
-            # Cast mask to feature floating-point dtype and expand dimension for broadcasting
+            # Cast mask tensor to feature floating-point dtype and add trailing dimension for broadcasting
             mask_expanded = samples_mask.to(features.dtype).unsqueeze(-1)  # Shape: [num_samples, 1]
-            # Zero out one-hot assignments for invalid padded samples
+            # Zero out one-hot allocations for masked padded samples
             valid_one_hot = one_hot * mask_expanded
         else:
             valid_one_hot = one_hot
 
-        # 3. Compute valid sample count per class category: shape [max_classes, 1]
+        # Calculate valid sample count per class category: shape [max_classes, 1]
         class_counts = valid_one_hot.sum(dim=0, keepdim=True).T
 
-        # 4. Aggregate feature vectors for each class via matrix multiplication: shape [max_classes, latent_dim]
+        # Aggregate feature vectors per class category via matrix multiplication: shape [max_classes, latent_dim]
         class_sums = torch.matmul(valid_one_hot.T, features)
 
-        # 5. Perform safe element-wise division (clamp prevents division-by-zero for absent classes)
+        # Compute mean class centroids using safe element-wise division (clamping prevents zero-division)
         centroids = class_sums / class_counts.clamp(min=1)
 
-        # 6. Construct boolean validity mask (True for present classes with valid counts > 0)
+        # Construct boolean validity mask indicating present active classes (sample count > 0)
         mask = (class_counts.squeeze(-1) > 0)
 
-        # Handle exponential moving average (EMA) update logic if running prototypes tracking is enabled
+        # Initialize dictionary container for updated state buffers
+        updated_buffers = {}
+
+        # Handle running prototype exponential moving average logic if enabled
         if self.keep_running_Prototype:
-            # Slice current step's buffers if per-step mode is active
-            if self.use_per_step_stats:
-                r_proto = self.running_prototypes[step_idx]
-                r_init = self.initialized_classes[step_idx]
+            # Retrieve persistent state buffers from task_buffers dictionary if passed, otherwise fall back to self
+            if task_buffers is not None and f"{prefix}running_prototypes" in task_buffers:
+                r_proto_full = task_buffers[f"{prefix}running_prototypes"]
+                r_init_full = task_buffers[f"{prefix}initialized_classes"]
             else:
-                r_proto = self.running_prototypes
-                r_init = self.initialized_classes
+                r_proto_full = self.running_prototypes
+                r_init_full = self.initialized_classes
+
+            # Slice current inner step's buffer view if per-step mode is active
+            if self.use_per_step_stats:
+                r_proto = r_proto_full[step_idx]
+                r_init = r_init_full[step_idx]
+            else:
+                r_proto = r_proto_full
+                r_init = r_init_full
 
             if training:
-                # Expand active class validity mask for vector broadcasting
+                # Expand active class mask for vector broadcasting along feature dimension
                 valid_mask = mask.unsqueeze(-1).to(features.dtype)
-                # Expand initialization boolean tracking mask for vector broadcasting
+                # Expand initialization tracker mask for vector broadcasting along feature dimension
                 is_init = r_init.unsqueeze(-1).to(features.dtype)
 
-                # Calculate standard exponential moving average (EMA) update step
+                # Compute exponential moving average update step using current batch centroids
                 updated_existing = (1 - self.momentum) * r_proto + self.momentum * centroids.detach()
 
-                # Avoid zero-initialization bias: assign raw centroid directly if class is uninitialized
+                # Avoid zero-initialization bias: assign raw batch centroid directly for newly seen classes
                 new_val_for_valid = is_init * updated_existing + (1 - is_init) * centroids.detach()
 
-                # Apply out-of-place update solely to classes present in current batch mask
+                # Apply update exclusively to active present classes in current batch mask
                 new_running_prototypes = valid_mask * new_val_for_valid + (1 - valid_mask) * r_proto
+                
+                # Combine class initialization boolean states via bitwise OR
+                new_init = r_init | mask
 
-                # Update state buffers out-of-place for vmap compatibility
+                # Construct new buffer tensors out-of-place to maintain pure functional execution
                 if self.use_per_step_stats:
-                    # Clone buffer tensor and replace the slice for the active inner step
-                    updated_rp = self.running_prototypes.clone()
-                    updated_rp[step_idx] = new_running_prototypes
-                    self.running_prototypes = updated_rp
+                    # Construct boolean mask identifying the current inner step index slice
+                    step_mask = (torch.arange(self.max_inner_steps, device=features.device) == step_idx)
+                    # Reshape step mask for 3D prototype broadcasting: [max_inner_steps, 1, 1]
+                    step_mask_proto = step_mask.view(-1, 1, 1)
+                    # Reshape step mask for 2D initialization broadcasting: [max_inner_steps, 1]
+                    step_mask_init = step_mask.view(-1, 1)
 
-                    updated_ic = self.initialized_classes.clone()
-                    updated_ic[step_idx] = r_init | mask
-                    self.initialized_classes = updated_ic
+                    # Update step slice out-of-place via torch.where selection
+                    updated_rp_full = torch.where(step_mask_proto, new_running_prototypes.unsqueeze(0), r_proto_full)
+                    updated_ic_full = torch.where(step_mask_init, new_init.unsqueeze(0), r_init_full)
                 else:
-                    # Directly re-bind newly computed 2D/1D tensors
-                    self.running_prototypes = new_running_prototypes
-                    self.initialized_classes = r_init | mask
+                    # Direct assignment for standard non-per-step mode
+                    updated_rp_full = new_running_prototypes
+                    updated_ic_full = new_init
 
-                # In training mode, return current batch centroids and batch presence mask
+                # Populate updated buffer states inside dictionary (avoiding self mutation)
+                updated_buffers[f"{prefix}running_prototypes"] = updated_rp_full
+                updated_buffers[f"{prefix}initialized_classes"] = updated_ic_full
+
+                # Assign current batch centroids and batch mask to outputs for training mode
                 out_centroids = centroids
                 out_mask = mask
             else:
-                # In evaluation/inference mode, return stored running prototypes and initialization mask
+                # Assign tracked running prototypes and initialization mask to outputs for evaluation mode
                 out_centroids = r_proto
                 out_mask = r_init
         else:
-            # Standard non-running prototype mode
+            # Standard non-running prototype mode assignment
             out_centroids = centroids
             out_mask = mask
 
-        # Detach outputs from autograd graph if detach_prototypes flag is enabled
+        # Detach prototype outputs from autograd graph if detach_prototypes flag is active
         if self.detach_prototypes:
-            return out_centroids.detach(), out_mask.detach()
+            return out_centroids.detach(), out_mask.detach(), updated_buffers
 
-        return out_centroids, out_mask
+        # Return computed centroids, presence mask, and updated state buffers
+        return out_centroids, out_mask, updated_buffers
 
 
 # ==============================================================================

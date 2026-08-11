@@ -66,6 +66,7 @@ class ProtoMAML_Model(nn.Module):
         x_s: torch.Tensor, 
         y_s: Dict[str, torch.Tensor], 
         current_fast_weights: Dict[str, torch.Tensor],
+        task_buffers: Dict[str, torch.Tensor] = None,
         inner_step: int = 0,
         training: bool = False,
         **kwargs
@@ -79,6 +80,7 @@ class ProtoMAML_Model(nn.Module):
             x_s (torch.Tensor): Support set input feature tensor.
             y_s (Dict[str, torch.Tensor]): Target dictionary containing 'labels' and optional 'samples_mask'.
             current_fast_weights (Dict[str, torch.Tensor]): Current fast weights dictionary.
+            task_buffers (Optional[Dict[str, torch.Tensor]]): Current task state buffers dictionary.
             inner_step (int): current inner gradient step
             training (bool): whether if you train or validate a model
 
@@ -86,9 +88,10 @@ class ProtoMAML_Model(nn.Module):
             Dict[str, torch.Tensor]: Updated fast weights dictionary with prototype-initialized head.
         """
         # 1. Isolate backbone parameters for isolated functional evaluation
-        backbone_params = {
+        all_task_states = {**current_fast_weights, **(task_buffers or {})}
+        backbone_states = {
             k.removeprefix("backbone."): v 
-            for k, v in current_fast_weights.items() 
+            for k, v in all_task_states.items() 
             if k.startswith("backbone.")
         }
 
@@ -98,19 +101,22 @@ class ProtoMAML_Model(nn.Module):
         if self.scaler:
             x_s = self.scaler(x_s)
 
-        features = torch.func.functional_call(self.backbone, backbone_params, (x_s,), forward_kwargs)
+        features = torch.func.functional_call(self.backbone, backbone_states, (x_s,), forward_kwargs)
 
         # 3. Extract target labels and optional samples validity mask from target dict
         labels = y_s["labels"]
         samples_mask = y_s.get("samples_mask", None)
 
         # 4. Compute masked prototypes with full gradient tracking back to features
-        centroids, mask = self.center_head.compute_class_centers(
+        centroids, mask, center_bufs = self.center_head.compute_class_centers(
             features=features, 
             labels=labels, 
-            samples_mask=samples_mask
+            samples_mask=samples_mask,
+            task_buffers=task_buffers,
+            prefix="center_head.",
         )
 
+        task_buffers.update(center_bufs)
         # 5. Convert prototypes to linear classifier weights via ProtoMAML equations:
         # W_k = 2 * c_k
         w_init = 2.0 * centroids  # Shape: [max_classes, latent_dim]

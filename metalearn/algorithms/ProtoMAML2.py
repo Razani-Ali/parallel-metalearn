@@ -156,7 +156,10 @@ class ProtoMAMLv2(MetaOptimizer):
         """
         # 1. DYNAMIC PROTOTYPE COMPUTATION
         # Calculate W and b from support set features using current backbone weights
-        proto_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights)
+        proto_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights,
+                                                           task_buffers=buffers,
+                                                           inner_step=inner_step,
+                                                           training=False)
 
         # 2. Combine dynamically generated head with backbone and static components
         combined_params = {**proto_weights, **static_params, **buffers}
@@ -261,7 +264,10 @@ class ProtoMAMLv2(MetaOptimizer):
                 last_step = (inner_step == self.num_inner_steps - 1)
                 if self.multi_step_loss and not last_step:
                     # Dynamically calculate prototypes using the intermediately adapted backbone
-                    proto_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights)
+                    proto_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights,
+                                                                       task_buffers=task_buffers,
+                                                                       inner_step=inner_step,
+                                                                       training=False)
                     combined = {**proto_weights, **static_params, **task_buffers}
                     
                     # Evaluate query loss
@@ -274,7 +280,12 @@ class ProtoMAMLv2(MetaOptimizer):
 
             # FINAL QUERY EVALUATION
             # Recompute prototype head weights using the fully adapted backbone
-            proto_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights)
+            proto_weights = self.model.initialize_head_weights(
+                x_s, y_s, fast_weights,
+                task_buffers=task_buffers,
+                inner_step=self.num_inner_steps - 1,
+                training=False)
+            
             combined = {**proto_weights, **static_params, **task_buffers}
             
             # Evaluate final meta-objective
@@ -290,7 +301,8 @@ class ProtoMAMLv2(MetaOptimizer):
             meta_loss = self._update_meta_loss(meta_loss, q_step_loss, target_step_idx)
 
             # Return scalar loss and metric for task
-            updated_task_buffers = out_dict.get("buffers", task_buffers)
+            raw_buffers = out_dict.get("buffers", task_buffers)
+            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
             return meta_loss, q_metric, updated_task_buffers
 
@@ -313,8 +325,11 @@ class ProtoMAMLv2(MetaOptimizer):
             with torch.no_grad():
                 for name, buffer_tensor in self.model.named_buffers():
                     if name in batched_buffers:
-                        mean_buf = batched_buffers[name].mean(dim=0)
-                        buffer_tensor.copy_(mean_buf)
+                        buf = batched_buffers[name]
+                        if buf.dtype == torch.bool:
+                            buffer_tensor.copy_(buf.any(dim=0))
+                        else:
+                            buffer_tensor.copy_(buf.mean(dim=0))
 
         # Return mean values for logging
         return (
@@ -355,7 +370,10 @@ class ProtoMAMLv2(MetaOptimizer):
 
             # Calculate final deterministic prototype head weights using adapted backbone
             final_weights = self.model.initialize_head_weights(
-                x_s, y_s, fast_weights, inner_step=self.num_inner_steps - 1, training=False, **kwargs
+                x_s, y_s, fast_weights,
+                task_buffers=task_buffers,
+                inner_step=self.num_inner_steps - 1,
+                training=False, **kwargs
             )
 
             # Capture updated task buffers
@@ -366,7 +384,8 @@ class ProtoMAMLv2(MetaOptimizer):
                 inner_step=self.num_inner_steps,
                 training=False, **kwargs
             )
-            updated_task_buffers = out_dict.get("buffers", task_buffers)
+            raw_buffers = out_dict.get("buffers", task_buffers)
+            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
             return final_weights, updated_task_buffers
 
@@ -382,7 +401,11 @@ class ProtoMAMLv2(MetaOptimizer):
 
             for name, buffer_tensor in self.model.named_buffers():
                 if name in batched_buffers:
-                    buffer_tensor.copy_(batched_buffers[name].mean(dim=0))
+                    buf = batched_buffers[name]
+                    if buf.dtype == torch.bool:
+                        buffer_tensor.copy_(buf.any(dim=0))
+                    else:
+                        buffer_tensor.copy_(buf.mean(dim=0))
 
         print("✅ ProtoMAML v2: Backbone, prototype head, and buffers successfully adapted and updated.")
 

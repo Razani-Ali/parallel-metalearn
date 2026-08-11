@@ -11,7 +11,7 @@ class PrototypicalNetwork(MetaOptimizer):
     Prototypical Networks Meta-Learning Algorithm.
 
     Executes purely functional, parameter-free inner adaptation via prototype 
-    extraction. Highly accelerated through vectorized task processing using `vmap`.
+    extraction. Highly accelerated through vectorized task processing using `torch.func.vmap`.
     """
 
     def __init__(
@@ -40,7 +40,7 @@ class PrototypicalNetwork(MetaOptimizer):
         self.loss_fn = loss_fn
         self.chunk_size = chunk_size
 
-        # Device assignment
+        # Device assignment and module transfer
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.loss_fn.to(self.device)
@@ -55,17 +55,18 @@ class PrototypicalNetwork(MetaOptimizer):
         model_states: Dict[str, torch.Tensor],
         training: bool = False,
         **kwargs
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
         """
-        Executes a functional forward pass and evaluates the loss.
+        Executes a functional forward pass and evaluates loss/metrics.
         """
         forward_kwargs = {"training": training, "num_step": 0}
         
-        # Trigger functional execution (Processes both Support and Query inherently)
+        # Trigger functional execution (processes both Support and Query inherently)
         out_dict = torch.func.functional_call(self.model, model_states, (x_q, x_s, y_s), forward_kwargs)
         
-        # Calculate cross-entropy loss over query logits
-        return self.loss_fn(out_dict=out_dict, targets=y_q, model_states=model_states, **kwargs), out_dict
+        # Calculate loss and evaluation metric over query predictions
+        loss_val = self.loss_fn(out_dict=out_dict, targets=y_q, model_states=model_states, **kwargs)
+        return loss_val, out_dict
 
     def step(
         self, 
@@ -76,7 +77,7 @@ class PrototypicalNetwork(MetaOptimizer):
         """
         Executes a single meta-training or meta-validation step over a batch of tasks.
         """
-        # Fetch batch
+        # Fetch next task batch from iterator
         Xs, Ys, Xq, Yq = next(task_itrator)
 
         # Device transfer utility
@@ -92,43 +93,55 @@ class PrototypicalNetwork(MetaOptimizer):
         Xquery = to_device(Xq, self.device)
         Yquery = to_device(Yq, self.device)
 
-        # Extract parameters for functional call
+        # Extract parameters and buffers as explicit dictionaries
         model_states = dict(self.model.named_parameters())
-        model_buffers = dict(self.model.named_buffers())
+        all_buffers = dict(self.model.named_buffers())  # 💡 Explicit dict conversion prevents generator errors
 
         def process_single_task(x_s, y_s, x_q, y_q, global_buffers):
-            """Core execution logic for a single task."""
+            """Core execution loop for a single task within vmap."""
             task_buffers = {k: v.clone() for k, v in global_buffers.items()}
-            # ProtoNet calculates prototypes and query loss directly in one step!
             combined = {**model_states, **task_buffers}
+            
+            # Compute loss and metric via functional call
             (loss, metric), out_dict = self.compute_loss(
                 x_s=x_s, y_s=y_s, x_q=x_q, y_q=y_q, 
                 model_states=combined, training=training, **kwargs
             )
-            updated_task_buffers = out_dict.get("buffers", task_buffers)
+            
+            # 💡 Safely detach buffers before escaping vmap closure to prevent vmap_inplace_plumbing errors
+            raw_buffers = out_dict.get("buffers", task_buffers)
+            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
             return loss, metric, updated_task_buffers
 
-        # Vectorize single task execution over the batch dimension
+        # Vectorize single-task processing over the task batch dimension
         vectorized_processor = vmap(
-            process_single_task, in_dims=(0, 0, 0, 0, None),
-            randomness="different", chunk_size=self.chunk_size
+            process_single_task, 
+            in_dims=(0, 0, 0, 0, None),
+            randomness="different", 
+            chunk_size=self.chunk_size
         )
 
-        # Launch parallelized computation
+        # Execute parallelized computation
         meta_losses, metrics, batched_buffers = vectorized_processor(
-            Xsupport, Ysupport, Xquery, Yquery, model_buffers)
+            Xsupport, Ysupport, Xquery, Yquery, all_buffers
+        )
 
-        # Backpropagation and optimization
+        # Outer-loop backpropagation and buffer synchronization
         if training:
             self.optimizer.zero_grad()
             meta_losses.mean().backward()
             self.optimizer.step()
+            
+            # 💡 Smart buffer synchronization respecting boolean and floating-point data types
             with torch.no_grad():
                 for name, buffer_tensor in self.model.named_buffers():
                     if name in batched_buffers:
-                        mean_buf = batched_buffers[name].mean(dim=0)
-                        buffer_tensor.copy_(mean_buf)
+                        buf = batched_buffers[name]
+                        if buf.dtype == torch.bool:
+                            buffer_tensor.copy_(buf.any(dim=0))
+                        else:
+                            buffer_tensor.copy_(buf.mean(dim=0))
 
         return (
             meta_losses.mean().item(),
@@ -155,28 +168,30 @@ class PrototypicalNetwork(MetaOptimizer):
             states = {**params, **task_buffers}
             forward_kwargs = {"training": False, "num_step": 0}
 
-            # Forward pass through backbone using functional_call
+            # Extract features via functional execution of backbone
             feat_s = torch.func.functional_call(self.model.backbone, states, (x_s,), forward_kwargs)
             feat_s_flat = feat_s.flatten(start_dim=-1) if feat_s.dim() > 2 else feat_s
 
-            # Compute task prototypes and class validity mask
             labels_s = y_s["labels"]
             samples_mask_s = y_s.get("samples_mask", None)
 
-            prototypes, class_mask = self.model.center_head.compute_class_centers(
+            # 💡 Unpack 3 values including updated buffer state dictionary
+            prototypes, class_mask, center_bufs = self.model.center_head.compute_class_centers(
                 features=feat_s_flat,
                 labels=labels_s,
                 samples_mask=samples_mask_s,
+                task_buffers=task_buffers,
+                prefix="center_head.",
                 training=False,
                 **kwargs
             )
+            
+            task_buffers.update(center_bufs)
+            updated_task_buffers = {k: v.detach() for k, v in task_buffers.items()}
 
-            # Retrieve updated model buffers (including running_prototypes if enabled)
-            out_buffers = dict(self.model.named_buffers())
+            return prototypes, class_mask, updated_task_buffers
 
-            return prototypes, class_mask, out_buffers
-
-        # Vectorize adaptation across task batch dimension
+        # Vectorize deployment adaptation across task batch dimension
         vectorized_adapt = vmap(_adapt_single_task, in_dims=(0, 0, None), chunk_size=self.chunk_size)
 
         with torch.no_grad():
@@ -185,17 +200,21 @@ class PrototypicalNetwork(MetaOptimizer):
                 Xsupport, Ysupport, all_buffers
             )
 
-            # Average computed prototypes and aggregate active class mask across tasks
+            # Aggregate prototypes and active class masks across tasks
             avg_prototypes = batched_prototypes.mean(dim=0)
             combined_class_mask = batched_masks.any(dim=0)
 
-            # Securely register prototypes and active masks for inference deployment
+            # Register deployed prototypes onto model for standalone inference
             self.model.deployed_prototypes = avg_prototypes
             self.model.deployed_class_mask = combined_class_mask
 
-            # Sync running buffers (running_prototypes, BatchNorm stats, etc.) back to model
+            # 💡 Sync running buffers respecting data types
             for name, buffer_tensor in self.model.named_buffers():
                 if name in batched_buffers:
-                    buffer_tensor.copy_(batched_buffers[name].mean(dim=0))
+                    buf = batched_buffers[name]
+                    if buf.dtype == torch.bool:
+                        buffer_tensor.copy_(buf.any(dim=0))
+                    else:
+                        buffer_tensor.copy_(buf.mean(dim=0))
 
             print("✅ ProtoNet: Prototypes and running buffers securely computed and registered for deployment.")

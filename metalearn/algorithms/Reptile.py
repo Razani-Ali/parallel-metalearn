@@ -200,7 +200,8 @@ class Reptile(MetaOptimizer):
                 training=training, **kwargs
             )
 
-            updated_task_buffers = out_dict.get("buffers", task_buffers)
+            raw_buffers = out_dict.get("buffers", task_buffers)
+            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
             return param_deltas, q_loss, q_metric, updated_task_buffers
 
@@ -301,7 +302,8 @@ class Reptile(MetaOptimizer):
             )
             
             # Extract updated buffers dictionary from forward output, falling back to task_buffers if empty
-            updated_task_buffers = out_dict.get("buffers", task_buffers)
+            raw_buffers = out_dict.get("buffers", task_buffers)
+            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
             # Return adapted weights and updated task buffers for batch aggregation
             return fast_weights, updated_task_buffers

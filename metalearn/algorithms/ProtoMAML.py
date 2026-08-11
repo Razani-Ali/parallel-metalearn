@@ -219,7 +219,9 @@ class ProtoMAML(MetaOptimizer):
 
             # Initialize classifier head using support set prototypes
             fast_weights = self.model.initialize_head_weights(
-                x_s, y_s, fast_weights, inner_step=0, training=False, **kwargs
+                x_s, y_s, fast_weights,
+                inner_step=0, training=False,
+                task_buffers=task_buffers, **kwargs
             )
 
             # Inner adaptation loop
@@ -240,7 +242,8 @@ class ProtoMAML(MetaOptimizer):
                 inner_step=self.num_inner_steps,
                 training=False, **kwargs
             )
-            updated_task_buffers = out_dict.get("buffers", task_buffers)
+            raw_buffers = out_dict.get("buffers", task_buffers)
+            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
             return fast_weights, updated_task_buffers
 
@@ -256,7 +259,11 @@ class ProtoMAML(MetaOptimizer):
             
             for name, buffer_tensor in self.model.named_buffers():
                 if name in batched_buffers:
-                    buffer_tensor.copy_(batched_buffers[name].mean(dim=0))
+                    buf = batched_buffers[name]
+                    if buf.dtype == torch.bool:
+                        buffer_tensor.copy_(buf.any(dim=0))
+                    else:
+                        buffer_tensor.copy_(buf.mean(dim=0))
 
         print("✅ ProtoMAML v1: Model parameters and buffers successfully adapted and updated.")
 
@@ -306,7 +313,10 @@ class ProtoMAML(MetaOptimizer):
             fast_weights = OrderedDict(initial_fast_weights)
             opt_state = self.inner_optimizer.init_state(fast_weights)
             meta_loss = torch.tensor(0.0, device=self.device)
-            fast_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights)
+            fast_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights,
+                                                              task_buffers=task_buffers,
+                                                              inner_step=0,
+                                                              training=False)
 
             # Execute inner adaptation steps
             for inner_step in range(self.num_inner_steps):
@@ -347,7 +357,8 @@ class ProtoMAML(MetaOptimizer):
             target_step_idx = max(0, self.num_inner_steps - 1)
             meta_loss = self._update_meta_loss(meta_loss, q_step_loss, target_step_idx)
 
-            updated_task_buffers = out_dict.get("buffers", task_buffers)
+            raw_buffers = out_dict.get("buffers", task_buffers)
+            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
             return meta_loss, q_metric, updated_task_buffers
 
@@ -370,8 +381,11 @@ class ProtoMAML(MetaOptimizer):
             with torch.no_grad():
                 for name, buffer_tensor in self.model.named_buffers():
                     if name in batched_buffers:
-                        mean_buf = batched_buffers[name].mean(dim=0)
-                        buffer_tensor.copy_(mean_buf)
+                        buf = batched_buffers[name]
+                        if buf.dtype == torch.bool:
+                            buffer_tensor.copy_(buf.any(dim=0))
+                        else:
+                            buffer_tensor.copy_(buf.mean(dim=0))
 
         # Return scalar metric values
         return (
