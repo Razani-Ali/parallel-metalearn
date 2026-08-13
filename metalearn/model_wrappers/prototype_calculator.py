@@ -144,8 +144,30 @@ class SimplePrototype(BasePrototype):
                 - mask: Boolean tensor of shape [max_classes] indicating active classes.
                 - updated_buffers: Dictionary containing state buffers updated purely out-of-place.
         """
-        # Extract adaptation inner-step index from context dictionary (defaults to step 0)
+        num_samples = features.shape[0]
+        device = features.device
         num_step = kwargs.get('inner_step', 0)
+        
+        if isinstance(num_step, int):
+            step_idx = min(num_step, self.max_inner_steps - 1)
+        else:
+            step_idx = num_step
+
+        # Zero-Shot Evaluation
+        if num_samples == 0:
+            buf_key = f"{prefix}running_prototypes"
+            if task_buffers is not None and buf_key in task_buffers:
+                r_proto_full = task_buffers[buf_key]
+            else:
+                r_proto_full = self.running_prototypes
+
+            if self.use_per_step_stats:
+                centroids = r_proto_full[step_idx]
+            else:
+                centroids = r_proto_full
+
+            mask = torch.ones(self.max_classes, dtype=torch.bool, device=device)
+            return centroids, mask, {}
         
         # Ensure step index is represented as a Tensor on the target compute device
         if isinstance(num_step, int):

@@ -86,8 +86,11 @@ class ProtoNet_Model(nn.Module):
         dropout_training = kwargs.get('training', self.training)
         center_bufs = {}
 
+        # Check if support set contains valid samples for Few-Shot calculation
+        has_support_samples = (x_s is not None and y_s is not None and x_s.shape[0] > 0)
+
         # 1. Extract support set features and calculate prototypes in Episodic Mode
-        if x_s is not None and y_s is not None:
+        if has_support_samples:
             # Pass support set through backbone
             feat_s = self.backbone(x_s, **kwargs)
 
@@ -115,15 +118,21 @@ class ProtoNet_Model(nn.Module):
             )
 
         else:
-            # Standard Inference Mode: Utilize pre-registered deployment prototypes
-            if self.deployed_prototypes is None:
-                raise RuntimeError(
-                    "❌ Deployed prototypes not found! "
-                    "Either pass (x_s, y_s) for episodic evaluation or call "
-                    "`algorithm.adapt_and_update(x_s, y_s)` prior to standard inference."
+            # 🚀 Zero-Shot Mode / Fallback
+            if self.deployed_prototypes is not None:
+                prototypes = self.deployed_prototypes
+                class_mask = self.deployed_class_mask
+
+            else:
+                dummy_feats = torch.empty((0, self.latent_dim), device=x_q.device)
+                dummy_labels = torch.empty((0,), dtype=torch.long, device=x_q.device)
+                
+                prototypes, class_mask, center_bufs = self.center_head.compute_class_centers(
+                    features=dummy_feats,
+                    labels=dummy_labels,
+                    prefix="center_head.",
+                    **kwargs
                 )
-            prototypes = self.deployed_prototypes
-            class_mask = self.deployed_class_mask
 
         # 2. Extract query set features
         feat_q = self.backbone(x_q, **kwargs)

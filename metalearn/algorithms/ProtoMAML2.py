@@ -243,47 +243,49 @@ class ProtoMAMLv2(MetaOptimizer):
             opt_state = self.inner_optimizer.init_state(fast_weights)
             # Initialize meta-loss accumulator
             meta_loss = torch.tensor(0.0, device=self.device)
+            is_zero_shot = (x_s.shape[0] == 0)
 
-            # INNER LOOP ADAPTATION (Backbone representation learning)
-            for inner_step in range(self.num_inner_steps):
-                # 1. Compute gradients for backbone. 
-                # (Head is dynamically computed inside inner_step_fn before loss eval)
-                grads = self.inner_step_fn(
-                    fast_weights, static_params, task_buffers,
-                    x_s, y_s, inner_step=inner_step,
-                    training=True, **kwargs
-                )
-                
-                # 2. Update backbone fast weights
-                fast_weights, opt_state = self.inner_optimizer(
-                    fast_weights=fast_weights, gradients=grads,
-                    state=opt_state, step=inner_step
-                )
-
-                # 3. Intermediate Query Evaluation for Multi-Step Loss
-                last_step = (inner_step == self.num_inner_steps - 1)
-                if self.multi_step_loss and not last_step:
-                    # Dynamically calculate prototypes using the intermediately adapted backbone
-                    proto_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights,
-                                                                       task_buffers=task_buffers,
-                                                                       inner_step=inner_step,
-                                                                       training=False)
-                    combined = {**proto_weights, **static_params, **task_buffers}
-                    
-                    # Evaluate query loss
-                    (q_step_loss, _), _ = self.compute_loss(
-                        X=x_q, Y=y_q, model_states=combined,
-                        loss_module=self.query_loss_fn, inner_step=inner_step,
+            if not is_zero_shot:
+                # INNER LOOP ADAPTATION (Backbone representation learning)
+                for inner_step in range(self.num_inner_steps):
+                    # 1. Compute gradients for backbone. 
+                    # (Head is dynamically computed inside inner_step_fn before loss eval)
+                    grads = self.inner_step_fn(
+                        fast_weights, static_params, task_buffers,
+                        x_s, y_s, inner_step=inner_step,
                         training=True, **kwargs
                     )
-                    meta_loss = self._update_meta_loss(meta_loss, q_step_loss, inner_step)
+                    
+                    # 2. Update backbone fast weights
+                    fast_weights, opt_state = self.inner_optimizer(
+                        fast_weights=fast_weights, gradients=grads,
+                        state=opt_state, step=inner_step
+                    )
+
+                    # 3. Intermediate Query Evaluation for Multi-Step Loss
+                    last_step = (inner_step == self.num_inner_steps - 1)
+                    if self.multi_step_loss and not last_step:
+                        # Dynamically calculate prototypes using the intermediately adapted backbone
+                        proto_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights,
+                                                                        task_buffers=task_buffers,
+                                                                        inner_step=inner_step,
+                                                                        training=False)
+                        combined = {**proto_weights, **static_params, **task_buffers}
+                        
+                        # Evaluate query loss
+                        (q_step_loss, _), _ = self.compute_loss(
+                            X=x_q, Y=y_q, model_states=combined,
+                            loss_module=self.query_loss_fn, inner_step=inner_step,
+                            training=True, **kwargs
+                        )
+                        meta_loss = self._update_meta_loss(meta_loss, q_step_loss, inner_step)
 
             # FINAL QUERY EVALUATION
             # Recompute prototype head weights using the fully adapted backbone
             proto_weights = self.model.initialize_head_weights(
                 x_s, y_s, fast_weights,
                 task_buffers=task_buffers,
-                inner_step=self.num_inner_steps - 1,
+                inner_step=self.num_inner_steps if not is_zero_shot else 0,
                 training=False)
             
             combined = {**proto_weights, **static_params, **task_buffers}

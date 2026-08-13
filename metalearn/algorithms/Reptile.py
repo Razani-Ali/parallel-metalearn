@@ -168,6 +168,7 @@ class Reptile(MetaOptimizer):
             task_buffers = {k: v.clone() for k, v in global_buffers.items()}
             fast_weights = OrderedDict(initial_fast_weights)
             opt_state = self.inner_optimizer.init_state(fast_weights)
+            is_zero_shot = (x_s.shape[0] == 0)
 
             if isinstance(y_s, dict) and "labels" in y_s and isinstance(y_q, dict) and "labels" in y_q and self.encoder is not None:
                 y_s_enc, y_q_enc = self.encoder(y_s["labels"], y_q["labels"])
@@ -175,17 +176,18 @@ class Reptile(MetaOptimizer):
                 y_s = {**y_s, "labels": y_s_enc}
                 y_q = {**y_q, "labels": y_q_enc}
 
-            # 1. Execute inner adaptation steps (Standard SGD towards task manifold)
-            for inner_step in range(self.num_inner_steps):
-                grads = self.inner_step_fn(
-                    fast_weights, static_params, task_buffers,
-                    x_s, y_s, inner_step=inner_step,
-                    training=True, **kwargs
-                )
-                fast_weights, opt_state = self.inner_optimizer(
-                    fast_weights=fast_weights, gradients=grads,
-                    state=opt_state, step=inner_step
-                )
+            if not is_zero_shot:
+                # 1. Execute inner adaptation steps (Standard SGD towards task manifold)
+                for inner_step in range(self.num_inner_steps):
+                    grads = self.inner_step_fn(
+                        fast_weights, static_params, task_buffers,
+                        x_s, y_s, inner_step=inner_step,
+                        training=True, **kwargs
+                    )
+                    fast_weights, opt_state = self.inner_optimizer(
+                        fast_weights=fast_weights, gradients=grads,
+                        state=opt_state, step=inner_step
+                    )
 
             # 2. Compute Reptile Deltas: (W_new - W_old)
             # This directly replaces the computational graph backpropagation of MAML
@@ -196,7 +198,7 @@ class Reptile(MetaOptimizer):
             (q_loss, q_metric), out_dict = self.compute_loss(
                 X=x_q, Y=y_q, model_states=combined,
                 loss_module=self.query_loss_fn,
-                inner_step=self.num_inner_steps,
+                inner_step=self.num_inner_steps if not is_zero_shot else 0,
                 training=training, **kwargs
             )
 

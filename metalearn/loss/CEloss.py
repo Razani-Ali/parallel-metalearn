@@ -66,7 +66,7 @@ class CrossEntropy(BaseLoss):
             mask = targets["samples_mask"].to(torch.float32)
 
             # Compute unreduced cross-entropy loss for each sample individually
-            raw_loss = F.cross_entropy(logits, labels, reduction='none')
+            raw_loss = F.cross_entropy(logits, labels, reduction='none', ignore_index=-1)
             # Zero out padded sample losses using mask and normalize by total valid samples
             loss = (raw_loss * mask).sum() / (mask.sum() + 1e-8)
 

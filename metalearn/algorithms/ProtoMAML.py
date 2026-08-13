@@ -313,43 +313,45 @@ class ProtoMAML(MetaOptimizer):
             fast_weights = OrderedDict(initial_fast_weights)
             opt_state = self.inner_optimizer.init_state(fast_weights)
             meta_loss = torch.tensor(0.0, device=self.device)
+            is_zero_shot = (x_s.shape[0] == 0)
             fast_weights = self.model.initialize_head_weights(x_s, y_s, fast_weights,
                                                               task_buffers=task_buffers,
                                                               inner_step=0,
                                                               training=False)
 
-            # Execute inner adaptation steps
-            for inner_step in range(self.num_inner_steps):
-                # Calculate support gradients
-                grads = self.inner_step_fn(
-                    fast_weights, static_params, task_buffers,
-                    x_s, y_s, inner_step=inner_step,
-                    training=True, **kwargs
-                )
-                
-                # Update task-specific fast weights via inner optimizer
-                fast_weights, opt_state = self.inner_optimizer(
-                    fast_weights=fast_weights, gradients=grads,
-                    state=opt_state, step=inner_step
-                )
-
-                # Accumulate multi-step query loss for intermediate adaptation steps
-                last_step = (inner_step == self.num_inner_steps - 1)
-                if self.multi_step_loss and not last_step:
-                    combined = {**fast_weights, **static_params, **task_buffers}
-                    (q_step_loss, _), _ = self.compute_loss(
-                        X=x_q, Y=y_q, model_states=combined,
-                        loss_module=self.query_loss_fn, inner_step=inner_step,
+            if not is_zero_shot:
+                # Execute inner adaptation steps
+                for inner_step in range(self.num_inner_steps):
+                    # Calculate support gradients
+                    grads = self.inner_step_fn(
+                        fast_weights, static_params, task_buffers,
+                        x_s, y_s, inner_step=inner_step,
                         training=True, **kwargs
                     )
-                    meta_loss = self._update_meta_loss(meta_loss, q_step_loss, inner_step)
+                    
+                    # Update task-specific fast weights via inner optimizer
+                    fast_weights, opt_state = self.inner_optimizer(
+                        fast_weights=fast_weights, gradients=grads,
+                        state=opt_state, step=inner_step
+                    )
+
+                    # Accumulate multi-step query loss for intermediate adaptation steps
+                    last_step = (inner_step == self.num_inner_steps - 1)
+                    if self.multi_step_loss and not last_step:
+                        combined = {**fast_weights, **static_params, **task_buffers}
+                        (q_step_loss, _), _ = self.compute_loss(
+                            X=x_q, Y=y_q, model_states=combined,
+                            loss_module=self.query_loss_fn, inner_step=inner_step,
+                            training=True, **kwargs
+                        )
+                        meta_loss = self._update_meta_loss(meta_loss, q_step_loss, inner_step)
 
             # Final Query Loss & Metric Evaluation on adapted weights
             combined = {**fast_weights, **static_params, **task_buffers}
             (q_step_loss, q_metric), out_dict = self.compute_loss(
                 X=x_q, Y=y_q, model_states=combined,
                 loss_module=self.query_loss_fn,
-                inner_step=self.num_inner_steps,
+                inner_step=self.num_inner_steps if not is_zero_shot else 0,
                 training=training, **kwargs
             )
             

@@ -163,6 +163,15 @@ Because MetaLearn processes inner-loop updates in a stateless, functional manner
 * **Zero-Overhead Aggregation:** Extract adapted local parameters $\theta_i'$ from each client task, perform global server aggregation (e.g., weighted averaging via `torch.stack(client_weights).mean(dim=0)`), and seamlessly set the new global start state for the next communication round.
 
 ---
+### 🌟 Dynamic Zero-Shot & Few-Shot Unified Execution
+---
+
+`parallel-metalearn` seamlessly bridges the gap between **Zero-Shot inference** and **Few-Shot adaptation**:
+
+* **Zero-Shot Mode (`support_sampler=None`):** Automatically bypasses inner-loop gradient adaptation steps. Metric-based models (ProtoNet / ProtoMAML) dynamically fall back to globally accumulated prototype moving averages (`running_prototypes`), enabling instantaneous zero-shot classification on seen domains.
+* **Few-Shot Mode:** Executes full parallelized $N$-step inner adaptation across task batches via `vmap`.
+
+---
 
 ## 📊 Experimental Setup & Benchmark Results
 

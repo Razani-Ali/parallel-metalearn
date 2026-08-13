@@ -393,7 +393,17 @@ class MetaTaskDataset(Dataset):
         q_samples_per_class = self._resolve_shot_per_class(self.query_shot, current_way)
 
         # Sample raw numpy instances
-        x_s_raw, y_s_raw, *_ = self.support_sampler.sample(target_classes, s_samples_per_class)
+        if self.support_sampler is None or sum(s_samples_per_class) == 0:
+            # Construct empty dummy support tensors matching signal shape
+            sample_x, _ = self.query_sampler.sample(target_classes[:1], (1,))
+            feature_shape = sample_x.shape[1:]
+            
+            x_s_raw = np.empty((0, *feature_shape), dtype=sample_x.dtype)
+            y_s_raw = np.empty((0,), dtype=np.int64)
+
+        else:
+            x_s_raw, y_s_raw, *_ = self.support_sampler.sample(target_classes, s_samples_per_class)
+            
         x_q_raw, y_q_raw, *_ = self.query_sampler.sample(target_classes, q_samples_per_class)
 
         # Pad and construct mask dictionaries
