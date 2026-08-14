@@ -4,9 +4,9 @@ import tempfile
 import torch
 from typing import Dict, Tuple, Any, Optional
 from tqdm.auto import tqdm
-
 from .Utils import init_history, update_history, setup_logger, format_time
 from metalearn.file_manager.FileHandle import remove_folder, safe_copy, replace_with_error
+from tqdm.auto import tqdm
 
 
 class MetaTrain:
@@ -165,7 +165,7 @@ class MetaTrain:
         
         # Configure logging system
         log_path = os.path.join(log_checkpoint_path, "log.txt") if log_checkpoint_path else None
-        self.logger = setup_logger(os.path.join(temp_path, 'log.txt'), verbose=verbose)
+        self.logger = setup_logger(os.path.join(temp_path, 'log.txt'), verbose=False)
 
         # Initialize tracking variables
         history = init_history()
@@ -191,9 +191,12 @@ class MetaTrain:
         if patience and no_improve_count >= patience:
             start_epoch = epochs
 
-        # --- 3. Main Outer Training Loop ---
+        # Progress Bar
+        last_val_loss_str = "N/A"
+        last_val_acc_str = "N/A"
+        pbar = tqdm(range(start_epoch, epochs), leave=True, desc="🚀 Meta-Training", dynamic_ncols=True)
+
         self.logger.info(f"{'+'*20} Starting Meta-Training Process... {'+'*20}\n")
-        pbar = tqdm(range(start_epoch, epochs), disable=verbose, leave=False, desc="Training")
 
         for epoch in pbar:
             # Record start time of pure training step
@@ -217,6 +220,8 @@ class MetaTrain:
                 val_loss, val_metric = self.algorithm.step(
                     self.ValIterator, training=False, **kwargs
                 )
+                last_val_loss_str = f"{val_loss:.4f}"
+                last_val_acc_str = f"{val_metric * 100:.2f}%"
             
             # Fetch current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -240,7 +245,12 @@ class MetaTrain:
             )
 
             # Update progress bar display
-            pbar.set_postfix({'T-Loss': f"{train_loss:.4f}", 'V-Loss': f"{val_loss:.4f}" if val_loss else "N/A"})
+            pbar.set_postfix({
+                'Tr-Loss': f"{train_loss:.4f}",
+                'Tr-Acc': f"{train_metric * 100:.1f}%",
+                'Val-Loss': last_val_loss_str,
+                'Val-Acc': last_val_acc_str
+            })
 
             # --- 4. Model Selection & Early Stopping ---
             if needs_checkpoint and self.ValIterator:
@@ -294,7 +304,7 @@ class MetaTrain:
 
         # --- 6. Post-Training Cleanup & Best Weight Restoration ---
         pbar.close()
-        if best_model_state and kwargs.get('load_best', True):
+        if best_model_state and kwargs.get('load_best_model', True):
             self.model.load_state_dict(best_model_state)
             self.logger.info(f"\nLoaded best model from epoch {best_epoch + 1} (Val Metric: {best_val_metric:.4f})")
 
@@ -318,16 +328,19 @@ class MetaTrain:
         Returns:
             Tuple[float, float]: Average loss and metric values across evaluation trials.
         """
-        total_loss, total_metric = 0.0, 0.0
 
-        pbar = tqdm(range(trials), desc="Evaluating", leave=False)
+        total_loss, total_metric = 0.0, 0.0
+        test_iter = iter(Loader)
+
+        pbar = tqdm(range(trials), desc="🧪 Meta-Testing", leave=False, dynamic_ncols=True)
+
         for _ in pbar:
             # Run non-training evaluation step
             loss, metric = self.algorithm.step(Loader, training=False, **kwargs)
             total_loss += loss / trials
             total_metric += metric / trials
             
-            pbar.set_postfix({'Loss': f"{loss:.4f}", 'Metric': f"{metric:.4f}"})
+            pbar.set_postfix({'Avg-Loss': f"{total_loss:.4f}", 'Avg-Acc': f"{total_metric * 100:.2f}%"})
 
         pbar.close()
         return total_loss, total_metric

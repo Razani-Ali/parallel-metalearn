@@ -50,28 +50,28 @@ class CNN2D4L_Backbone(nn.Module):
         # Block 1
         x = self.conv1(x)
         if self.bn1 is not None:
-            x = self.bn1(x, kwargs)
+            x = self.bn1(x, **kwargs)
         x = self.relu1(x)
         x = self.pool1(x)
 
         # Block 2
         x = self.conv2(x)
         if self.bn2 is not None:
-            x = self.bn2(x, kwargs)
+            x = self.bn2(x, **kwargs)
         x = self.relu2(x)
         x = self.pool2(x)
 
         # Block 3
         x = self.conv3(x)
         if self.bn3 is not None:
-            x = self.bn3(x, kwargs)
+            x = self.bn3(x, **kwargs)
         x = self.relu3(x)
         x = self.pool3(x)
 
         # Block 4
         x = self.conv4(x)
         if self.bn4 is not None:
-            x = self.bn4(x, kwargs)
+            x = self.bn4(x, **kwargs)
         x = self.relu4(x)
         x = self.pool4(x)
 
