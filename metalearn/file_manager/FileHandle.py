@@ -224,7 +224,7 @@ def safe_copy(src, dst, max_retries=7, chunk_size=128*1024*1024,
             for i in range(max_retries):
                 try:
                     with tqdm(total=total_bytes, unit='B', unit_scale=True, 
-                              unit_divisor=1024, desc=desc_msg, leave=True) as bar:
+                              unit_divisor=1024, desc=desc_msg, leave=False) as bar:
                         
                         if is_directory:
                             if p_dst.exists():

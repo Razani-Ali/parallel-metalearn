@@ -149,7 +149,6 @@ class MetaTrain:
         """
         # --- 1. Setup & Directory Initialization ---
         erl_stp_tresh = kwargs.get("erl_stp_tresh", 1e-4)
-        verbose = kwargs.get('verbose', True)
         
         # Set temporary working directory
         temp_path = temp_path or tempfile.gettempdir()
@@ -207,6 +206,9 @@ class MetaTrain:
                 self.TrainIterator, training=True, epoch=epoch, epochs=epochs-1, **kwargs
             )
 
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             # Calculate pure training latency (excluding evaluation overhead)
             t_end = time.time()
             epoch_time = t_end - t_start
@@ -217,9 +219,13 @@ class MetaTrain:
             
             # Execute meta-validation step only at checkpoint steps
             if self.ValIterator and needs_checkpoint:
-                val_loss, val_metric = self.algorithm.step(
-                    self.ValIterator, training=False, **kwargs
+                val_trials = kwargs.get('val_trials', 50)
+                val_loss, val_metric = self.meta_test(
+                    Loader=self.ValIterator, 
+                    trials=val_trials, 
+                    **kwargs
                 )
+
                 last_val_loss_str = f"{val_loss:.4f}"
                 last_val_acc_str = f"{val_metric * 100:.2f}%"
             
@@ -337,6 +343,10 @@ class MetaTrain:
         for _ in pbar:
             # Run non-training evaluation step
             loss, metric = self.algorithm.step(Loader, training=False, **kwargs)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             total_loss += loss / trials
             total_metric += metric / trials
             

@@ -5,7 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Elastic factors for each class as suggested in paper:
-# Meta-learning with elastic prototypical network for fault transfer diagnosis of bearings under unstable speeds 
+# Meta-learning with elastic prototypical network for fault transfer diagnosis
+# of bearings under unstable speeds 
 # https://doi.org/10.1016/j.ress.2024.110001
 
 

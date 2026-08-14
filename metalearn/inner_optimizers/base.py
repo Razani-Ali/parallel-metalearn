@@ -139,7 +139,8 @@ class BaseInnerOptimizer(nn.Module, ABC):
         fast_weights: Dict[str, torch.Tensor], 
         gradients: Dict[str, torch.Tensor], 
         state: Dict, 
-        step: int, 
+        step: int,
+        training: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], Dict]:
         """
         Abstract forward pass to update fast weights based on computed gradients.
@@ -149,6 +150,7 @@ class BaseInnerOptimizer(nn.Module, ABC):
             gradients (Dict[str, torch.Tensor]): Gradients corresponding to fast weights.
             state (Dict): Optimizer state container (e.g., momentum, square averages).
             step (int): Current inner adaptation step index.
+        training (bool): Meta-training or meta-testing
 
         Returns:
             Tuple[Dict[str, torch.Tensor], Dict]: Tuple of updated fast weights and new state dict.

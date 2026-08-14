@@ -37,10 +37,12 @@ class InnerSGD(BaseInnerOptimizer):
         gradients: Dict[str, torch.Tensor], 
         state: Dict, 
         step: int, 
+        training: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], Dict]:
         """Executes a functional SGD update step across fast weights."""
         # Detach gradients if first-order approximation is enabled
-        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if self.first_order else gradients
+        should_detach = self.first_order or not training
+        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if should_detach else gradients
         # Extract current step learning rate tree
         lr_tree = self._get_param_tree(self.lrs, fast_weights, step, "lr")
 
@@ -90,10 +92,12 @@ class InnerSGDMomentum(BaseInnerOptimizer):
         gradients: Dict[str, torch.Tensor], 
         state: Dict, 
         step: int, 
+        training: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], Dict]:
         """Executes a functional SGD with Momentum update step."""
         # Handle first-order gradient detachment
-        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if self.first_order else gradients
+        should_detach = self.first_order or not training
+        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if should_detach else gradients
         # Retrieve hyper-parameter PyTrees for the current step
         lr_tree = self._get_param_tree(self.lrs, fast_weights, step, "lr")
         mom_tree = self._get_param_tree(self.momentums, fast_weights, step, "mom")
@@ -157,10 +161,12 @@ class InnerRMSprop(BaseInnerOptimizer):
         gradients: Dict[str, torch.Tensor], 
         state: Dict, 
         step: int, 
+        training: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], Dict]:
         """Executes a functional RMSprop update step."""
         # Handle first-order gradient detachment
-        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if self.first_order else gradients
+        should_detach = self.first_order or not training
+        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if should_detach else gradients
         # Retrieve hyper-parameter PyTrees for the current step
         lr_tree = self._get_param_tree(self.lrs, fast_weights, step, "lr")
         alpha_tree = self._get_param_tree(self.alphas, fast_weights, step, "alpha")
@@ -219,10 +225,12 @@ class InnerAdagrad(BaseInnerOptimizer):
         gradients: Dict[str, torch.Tensor], 
         state: Dict, 
         step: int, 
+        training: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], Dict]:
         """Executes a functional Adagrad update step."""
         # Handle first-order gradient detachment
-        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if self.first_order else gradients
+        should_detach = self.first_order or not training
+        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if should_detach else gradients
         # Retrieve hyper-parameter PyTrees for the current step
         lr_tree = self._get_param_tree(self.lrs, fast_weights, step, "lr")
         eps_tree = self._get_param_tree(self.epss, fast_weights, step, "eps")
@@ -286,10 +294,12 @@ class InnerAdadelta(BaseInnerOptimizer):
         gradients: Dict[str, torch.Tensor], 
         state: Dict, 
         step: int, 
+        training: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], Dict]:
         """Executes a functional Adadelta update step."""
         # Handle first-order gradient detachment
-        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if self.first_order else gradients
+        should_detach = self.first_order or not training
+        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if should_detach else gradients
         # Retrieve hyper-parameter PyTrees for current step
         lr_tree = self._get_param_tree(self.lrs, fast_weights, step, "lr")
         rho_tree = self._get_param_tree(self.rhos, fast_weights, step, "rho")
@@ -367,10 +377,12 @@ class InnerAdam(BaseInnerOptimizer):
         gradients: Dict[str, torch.Tensor], 
         state: Dict, 
         step: int, 
+        training: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], Dict]:
         """Executes a functional Adam update step with bias correction."""
         # Handle first-order gradient detachment
-        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if self.first_order else gradients
+        should_detach = self.first_order or not training
+        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if should_detach else gradients
         # Retrieve hyper-parameter PyTrees for the current step
         lr_tree = self._get_param_tree(self.lrs, fast_weights, step, "lr")
         b1_tree = self._get_param_tree(self.beta1s, fast_weights, step, "b1")
@@ -455,10 +467,12 @@ class InnerAdamax(BaseInnerOptimizer):
         gradients: Dict[str, torch.Tensor], 
         state: Dict, 
         step: int, 
+        training: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], Dict]:
         """Executes a functional Adamax update step."""
         # Handle first-order gradient detachment
-        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if self.first_order else gradients
+        should_detach = self.first_order or not training
+        grads_tree = pytree.tree_map(lambda g: g.detach(), gradients) if should_detach else gradients
         # Retrieve hyper-parameter PyTrees for current step
         lr_tree = self._get_param_tree(self.lrs, fast_weights, step, "lr")
         b1_tree = self._get_param_tree(self.beta1s, fast_weights, step, "b1")

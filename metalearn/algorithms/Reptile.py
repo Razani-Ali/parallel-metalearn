@@ -1,18 +1,17 @@
 from collections import OrderedDict
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union, Callable, Any
 import torch
+import torch.utils._pytree as pytree
+from torch.func import grad, vmap
 from metalearn.loss.base import BaseLoss
 from .BaseLearner import MetaOptimizer
 from metalearn.inner_optimizers.base import BaseInnerOptimizer
-from torch.func import grad, vmap
 from metalearn.model_wrappers.MAMLWrapper import MAML_Model
-import torch.utils._pytree as pytree
 from metalearn.loss import LabelEncoder
 
 
 # ==============================================================================
 # ACKNOWLEDGEMENT & CITATION:
-# The Reptile optimization strategy implemented here is based on:
 #
 # Nichol, A., Achiam, J., & Schulman, J. (2018).
 # "On First-Order Meta-Learning Algorithms." 
@@ -24,12 +23,15 @@ class Reptile(MetaOptimizer):
     """
     Reptile Meta-Learning Algorithm.
 
-    A first-order meta-learning optimization algorithm. Instead of differentiating
-    through the inner-loop optimization path like MAML, Reptile adapts parameters 
-    using the inner optimizer and updates the global meta-parameters towards the 
-    adapted task-specific weights using weight deltas (W_new - W_old).
-    
-    Features fully vectorized task processing via `torch.func.vmap`.
+    A simple, highly scalable first-order meta-learning algorithm. Instead of differentiating
+    through the inner adaptation path (like MAML), Reptile executes task-level gradient descent
+    and performs outer updates by treating weight deltas (W_adapted - W_initial) as effective pseudo-gradients.
+
+    Key Features:
+    - Stateless vectorized task computation via `torch.func.vmap`.
+    - Chunked execution engine preventing GPU Out-Of-Memory (OOM) failures.
+    - Zero computation graph overhead during pure inference/evaluation phases.
+    - Task-level running buffer synchronization (e.g., BatchNorm updates).
     """
 
     def __init__(
@@ -40,41 +42,44 @@ class Reptile(MetaOptimizer):
         inner_optimizer: BaseInnerOptimizer,
         support_loss_fn: BaseLoss,
         query_loss_fn: Optional[BaseLoss] = None,
-        encoder: LabelEncoder = None,
+        encoder: Optional[LabelEncoder] = None,
         inner_steps: int = 5,
         chunk_size: int = 8,
         device: Optional[torch.device] = None,
-        **kwargs,
+        **kwargs: Any,
     ):
         """
-        Initializes the Reptile meta-optimizer module.
+        Initializes the Reptile meta-optimizer instance.
 
         Args:
-            model (MAML_Model): The base neural network model.
-            optimizer (torch.optim.Optimizer): The outer-loop optimizer (e.g., Adam).
-            inner_optimizer (BaseInnerOptimizer): The task-level inner-loop optimizer.
-            support_loss_fn (BaseLoss): Loss module used during support set adaptation.
-            query_loss_fn (Optional[BaseLoss]): Loss module used for query evaluation.
-            encoder (LabelEncoder): One-Hot Encoder for categorical labels
-            inner_steps (int): Number of gradient adaptation steps in the inner loop.
-            chunk_size (int): Chunk size for vmap memory management.
-            device (Optional[torch.device]): Target compute device.
+            model (MAML_Model): The base neural network wrapper model.
+            optimizer (torch.optim.Optimizer): The outer-loop meta-optimizer (e.g., Adam).
+            inner_optimizer (BaseInnerOptimizer): Task-level inner optimizer adapting weights.
+            support_loss_fn (BaseLoss): Loss module evaluated during support set adaptation.
+            query_loss_fn (Optional[BaseLoss]): Loss module evaluated for query performance.
+            encoder (Optional[LabelEncoder]): Label re-indexing encoder.
+            inner_steps (int): Total number of inner gradient steps applied on the support set.
+            chunk_size (int): Sub-batch size processed concurrently to cap VRAM consumption.
+            device (Optional[torch.device]): Target hardware compute device (CPU or GPU).
+            **kwargs: Additional operational parameters.
         """
+        # Initialize base MetaOptimizer class
         super().__init__()
-        # Store primary components
+
+        # Store primary components and hyper-parameters
         self.model = model
         self.optimizer = optimizer
         self.inner_optimizer = inner_optimizer
-        
-        # Loss function setup
+
+        # Configure loss calculation modules
         self.support_loss_fn = support_loss_fn
         self.query_loss_fn = query_loss_fn or support_loss_fn
-        
+
         self.num_inner_steps = inner_steps
         self.chunk_size = chunk_size
         self.encoder = encoder
 
-        # Device assignment and module transfer
+        # Resolve target compute device and transfer all modules
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.inner_optimizer.to(self.device)
@@ -85,70 +90,205 @@ class Reptile(MetaOptimizer):
         # Register learnable inner-loop parameters to outer optimizer
         inner_params = list(self.inner_optimizer.inner_lr_parameters())
         if inner_params:
-            self.optimizer.add_param_group({"params": [p for n, p in inner_params]})
+            self.optimizer.add_param_group({"params": [p for _, p in inner_params]})
 
-        # Functional gradient calculation wrapper for inner loop steps
-        # Reptile just needs first-order gradients for the inner updates
-        self.inner_step_fn = grad(self._inner_loss_fn, argnums=0)
+        # Functional gradient calculation wrapper for inner loop steps (First-Order gradients)
+        self.inner_step_fn = grad(self._inner_loss_fn, argnums=0, has_aux=True)
 
-    def _extract_model_states(self) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], OrderedDict]:
-        """Extracts static parameters, buffers, and initial fast weights."""
+    def _extract_model_states(
+        self,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], OrderedDict]:
+        """
+        Splits model states into static parameters, persistent buffers, and initial fast weights.
+
+        Returns:
+            Tuple[Dict, Dict, OrderedDict]: 
+                (static_parameters, all_buffers, initial_fast_weights)
+        """
+        # Extract all named parameters and buffers as dictionaries
         all_params = dict(self.model.named_parameters())
         all_buffers = dict(self.model.named_buffers())
-        
+
+        # Identify trainable keys designated for fast adaptation
         trainable_keys = list(OrderedDict(self.model.get_fast_weights()).keys())
-        
+
+        # Separate static parameters from fast-adapting parameters
         static_params = {k: v for k, v in all_params.items() if k not in trainable_keys}
         initial_fast_weights = OrderedDict({k: all_params[k] for k in trainable_keys})
-        
+
         return static_params, all_buffers, initial_fast_weights
 
     def _inner_loss_fn(
-        self, 
-        fast_weights: Dict[str, torch.Tensor], 
-        static_params: Dict[str, torch.Tensor], 
-        buffers: Dict[str, torch.Tensor], 
-        x_s: torch.Tensor, 
-        y_s: Dict[str, torch.Tensor], 
-        **kwargs
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Computes support loss for a single inner-step adaptation."""
+        self,
+        fast_weights: Dict[str, torch.Tensor],
+        static_params: Dict[str, torch.Tensor],
+        buffers: Dict[str, torch.Tensor],
+        x_s: torch.Tensor,
+        y_s: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        inner_step: int = 0,
+        training: bool = False,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Computes support loss for a single inner-step adaptation.
+
+        Returns:
+            Tuple[torch.Tensor, Dict[str, torch.Tensor]]: 
+                Evaluated scalar loss tensor and updated model buffers dictionary.
+        """
+        # Combine fast weights, static parameters, and model buffers
         combined_params = {**fast_weights, **static_params, **buffers}
-        (loss, _), _ = self.compute_loss(
-            X=x_s, Y=y_s, model_states=combined_params, loss_module=self.support_loss_fn, **kwargs
+
+        # Calculate support loss using functional evaluation
+        (loss, _), out_dict = self.compute_loss(
+            X=x_s,
+            Y=y_s,
+            model_states=combined_params,
+            loss_module=self.support_loss_fn,
+            inner_step=inner_step,
+            training=training,
+            **kwargs,
         )
-        return loss
+
+        # Return loss for autograd and captured buffer modifications
+        return loss, out_dict.get("buffers", buffers)
 
     def compute_loss(
-        self, 
-        *, 
-        X: torch.Tensor, 
-        Y: Dict[str, torch.Tensor], 
-        model_states: Dict[str, torch.Tensor], 
-        loss_module: BaseLoss, 
-        **kwargs
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Performs functional forward pass and computes evaluation metrics."""
-        forward_kwargs = kwargs.get("kwargs_to_forward", {})
-        out_dict = torch.func.functional_call(self.model, model_states, (X,), forward_kwargs)
-        return loss_module(out_dict=out_dict, targets=Y, model_states=model_states, **kwargs), out_dict
+        self,
+        *,
+        X: torch.Tensor,
+        Y: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        model_states: Dict[str, torch.Tensor],
+        loss_module: BaseLoss,
+        inner_step: int = 0,
+        training: bool = False,
+        **kwargs: Any,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
+        """
+        Performs a functional forward pass and computes evaluation metrics.
+        """
+        # Pack operational context flags to ensure functional_call compatibility
+        forward_kwargs = {"training": training, "num_step": inner_step}
 
-    # =========================================================================
-    # 1. Main Training/Evaluation Step 
-    # =========================================================================
+        # Execute stateless functional forward pass on model
+        out_dict = torch.func.functional_call(self.model, model_states, (X,), forward_kwargs)
+
+        # Evaluate loss and performance metric
+        loss_and_metric = loss_module(out_dict=out_dict, targets=Y, model_states=model_states, **kwargs)
+
+        return loss_and_metric, out_dict
+
+    def _accumulate_chunked_step(
+        self,
+        vectorized_processor: Callable,
+        Xsupport: Union[torch.Tensor, Dict],
+        Ysupport: Union[torch.Tensor, Dict],
+        Xquery: Union[torch.Tensor, Dict],
+        Yquery: Union[torch.Tensor, Dict],
+        all_buffers: Dict[str, torch.Tensor],
+        training: bool,
+    ) -> Tuple[Dict[str, torch.Tensor], float, float, Dict[str, torch.Tensor]]:
+        """
+        Processes Reptile tasks in memory-capped chunks.
+        Aggregates parameter deltas across chunks while strictly capping GPU memory footprint.
+
+        Args:
+            vectorized_processor (Callable): Function mapped across tasks via torch.func.vmap.
+            Xsupport (Union[torch.Tensor, Dict]): Batched support inputs.
+            Ysupport (Union[torch.Tensor, Dict]): Batched support targets.
+            Xquery (Union[torch.Tensor, Dict]): Batched query inputs.
+            Yquery (Union[torch.Tensor, Dict]): Batched query targets.
+            all_buffers (Dict[str, torch.Tensor]): Master model buffers dictionary.
+            training (bool): Operational training flag.
+
+        Returns:
+            Tuple[Dict[str, torch.Tensor], float, float, Dict[str, torch.Tensor]]:
+                - accumulated_deltas: Weighted parameter deltas (W_adapted - W_initial).
+                - total_query_loss: Mean query loss across all tasks.
+                - total_metric: Mean query performance metric across all tasks.
+                - accumulated_buffers: Weighted running buffers dictionary.
+        """
+        total_query_loss = 0.0
+        total_metric = 0.0
+        accumulated_deltas: Dict[str, torch.Tensor] = {}
+        accumulated_buffers: Dict[str, torch.Tensor] = {}
+
+        # Resolve total batch size across tasks
+        batch_size = Xsupport.shape[0] if isinstance(Xsupport, torch.Tensor) else Xsupport["labels"].shape[0]
+        num_chunks = (batch_size + self.chunk_size - 1) // self.chunk_size
+
+        for i in range(num_chunks):
+            start_idx = i * self.chunk_size
+            end_idx = min(start_idx + self.chunk_size, batch_size)
+
+            # Helper to slice both tensors and dictionaries of tensors
+            def slice_data(obj):
+                if isinstance(obj, torch.Tensor):
+                    return obj[start_idx:end_idx]
+                elif isinstance(obj, dict):
+                    return {k: v[start_idx:end_idx] for k, v in obj.items()}
+                return obj
+
+            # Extract slices for current chunk
+            X_s_chunk = slice_data(Xsupport)
+            Y_s_chunk = slice_data(Ysupport)
+            X_q_chunk = slice_data(Xquery)
+            Y_q_chunk = slice_data(Yquery)
+
+            # Process chunk tasks in parallel
+            chunk_deltas, q_losses, q_metrics, batched_buffers = vectorized_processor(
+                X_s_chunk, Y_s_chunk, X_q_chunk, Y_q_chunk, all_buffers
+            )
+
+            # Calculate chunk weight factor relative to total batch size
+            chunk_weight = (end_idx - start_idx) / batch_size
+
+            # Accumulate parameter deltas
+            with torch.no_grad():
+                for name, delta_tensor in chunk_deltas.items():
+                    weighted_delta = delta_tensor.mean(dim=0) * chunk_weight
+                    if name not in accumulated_deltas:
+                        accumulated_deltas[name] = weighted_delta
+                    else:
+                        accumulated_deltas[name] += weighted_delta
+
+                # Accumulate buffer updates across chunks
+                for name in batched_buffers:
+                    buf = batched_buffers[name]
+                    if buf.dtype == torch.bool:
+                        mean_buf = buf.any(dim=0)
+                        accumulated_buffers[name] = mean_buf
+                    else:
+                        mean_buf = buf.mean(dim=0) * chunk_weight
+                        if name not in accumulated_buffers:
+                            accumulated_buffers[name] = mean_buf
+                        else:
+                            accumulated_buffers[name] += mean_buf
+
+            # Accumulate reporting statistics
+            total_query_loss += q_losses.mean().item() * chunk_weight
+            total_metric += q_metrics.mean().item() * chunk_weight
+
+            # Clear CUDA allocation cache per chunk
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return accumulated_deltas, total_query_loss, total_metric, accumulated_buffers
+
     def step(
-        self, 
-        task_itrator, 
-        training: bool = True, 
-        **kwargs
+        self,
+        task_itrator: Any,
+        training: bool = True,
+        **kwargs: Any,
     ) -> Tuple[float, float]:
         """
         Executes a single Reptile meta-training step.
-        Adapts weights on the support set, computes weight deltas, and directly 
-        injects them into the optimizer gradients.
+        Adapts weights on the support set, computes weight deltas, and injects them 
+        into the outer optimizer as effective gradients.
         """
         Xs, Ys, Xq, Yq = next(task_itrator)
 
+        # Device transfer utility
         def to_device(obj, device):
             if isinstance(obj, torch.Tensor):
                 return obj.to(device)
@@ -168,93 +308,120 @@ class Reptile(MetaOptimizer):
             task_buffers = {k: v.clone() for k, v in global_buffers.items()}
             fast_weights = OrderedDict(initial_fast_weights)
             opt_state = self.inner_optimizer.init_state(fast_weights)
-            is_zero_shot = (x_s.shape[0] == 0)
+            is_zero_shot = x_s.shape[0] == 0
 
+            # Dynamic categorical label re-indexing
             if isinstance(y_s, dict) and "labels" in y_s and isinstance(y_q, dict) and "labels" in y_q and self.encoder is not None:
                 y_s_enc, y_q_enc = self.encoder(y_s["labels"], y_q["labels"])
-                
                 y_s = {**y_s, "labels": y_s_enc}
                 y_q = {**y_q, "labels": y_q_enc}
 
             if not is_zero_shot:
-                # 1. Execute inner adaptation steps (Standard SGD towards task manifold)
+                # 1. Execute inner adaptation steps towards task manifold
                 for inner_step in range(self.num_inner_steps):
-                    grads = self.inner_step_fn(
-                        fast_weights, static_params, task_buffers,
-                        x_s, y_s, inner_step=inner_step,
-                        training=True, **kwargs
-                    )
-                    fast_weights, opt_state = self.inner_optimizer(
-                        fast_weights=fast_weights, gradients=grads,
-                        state=opt_state, step=inner_step
+
+                    # Compute support gradients using First-Order autograd
+                    grads, updated_task_buffers = self.inner_step_fn(
+                        fast_weights,
+                        static_params,
+                        task_buffers,
+                        x_s,
+                        y_s,
+                        inner_step=inner_step,
+                        training=True,
+                        **kwargs,
                     )
 
-            # 2. Compute Reptile Deltas: (W_new - W_old)
-            # This directly replaces the computational graph backpropagation of MAML
+                    # Update local task buffers
+                    task_buffers = {k: v.detach() for k, v in updated_task_buffers.items()}
+
+                    # Update fast weights via inner optimizer
+                    fast_weights, opt_state = self.inner_optimizer(
+                        fast_weights=fast_weights,
+                        gradients=grads,
+                        state=opt_state,
+                        step=inner_step,
+                        training=False
+                    )
+
+            # 2. Compute Reptile Deltas: (W_adapted - W_initial)
             param_deltas = pytree.tree_map(lambda w_new, w_old: w_new - w_old, fast_weights, initial_fast_weights)
 
-            # 3. Final Query Evaluation (For logging/metrics only)
+            # 3. Final Query Evaluation (For evaluation/metrics logging)
             combined = {**fast_weights, **static_params, **task_buffers}
-            (q_loss, q_metric), out_dict = self.compute_loss(
-                X=x_q, Y=y_q, model_states=combined,
-                loss_module=self.query_loss_fn,
-                inner_step=self.num_inner_steps if not is_zero_shot else 0,
-                training=training, **kwargs
-            )
+            with torch.no_grad():
+                (q_loss, q_metric), out_dict = self.compute_loss(
+                    X=x_q,
+                    Y=y_q,
+                    model_states=combined,
+                    loss_module=self.query_loss_fn,
+                    inner_step=self.num_inner_steps if not is_zero_shot else 0,
+                    training=False,
+                    **kwargs,
+                )
 
             raw_buffers = out_dict.get("buffers", task_buffers)
             updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
             return param_deltas, q_loss, q_metric, updated_task_buffers
 
-        # Parallelize single task processing across the task batch using vmap
+        # Vectorize single-task processing across the task batch dimension
         vectorized_processor = vmap(
-            process_single_task, in_dims=(0, 0, 0, 0, None),
-            randomness="different", chunk_size=self.chunk_size
+            process_single_task,
+            in_dims=(0, 0, 0, 0, None),
+            randomness="different",
         )
 
-        # Retrieve vectorized weight deltas and query metrics
-        vectorized_deltas, query_losses, query_metrics, batched_buffers = vectorized_processor(
-            Xsupport, Ysupport, Xquery, Yquery, all_buffers
-        )
-
-        # Outer loop meta-optimization step (First-Order Injection)
+        # Reset outer optimizer gradients before accumulation
         if training:
             self.optimizer.zero_grad()
-            
+
+        # Execute manual chunked accumulation engine
+        vectorized_deltas, query_loss, query_metric, accumulated_buffers = self._accumulate_chunked_step(
+            vectorized_processor,
+            Xsupport,
+            Ysupport,
+            Xquery,
+            Yquery,
+            all_buffers,
+            training,
+        )
+
+        # Outer loop meta-optimization step (First-Order Pseudo-Gradient Injection)
+        if training:
             for name, param in self.model.named_parameters():
                 if name in vectorized_deltas:
-                    # Average the deltas across the task batch (dim=0)
-                    avg_delta = vectorized_deltas[name].mean(dim=0)
                     # Reptile Update Rule: Theta = Theta + lr * Delta
-                    # Adam/SGD do: Theta = Theta - lr * grad
-                    # Therefore, we set grad = -Delta
-                    param.grad = -avg_delta.detach()
-            
+                    # Standard optimizers: Theta = Theta - lr * Grad  ==>  Grad = -Delta
+                    param.grad = -vectorized_deltas[name].detach()
+
+            # Execute outer optimizer step
             self.optimizer.step()
 
+            # Synchronize model running buffers
             with torch.no_grad():
                 for name, buffer_tensor in self.model.named_buffers():
-                    if name in batched_buffers:
-                        mean_buf = batched_buffers[name].mean(dim=0)
-                        buffer_tensor.copy_(mean_buf)
+                    if name in accumulated_buffers:
+                        buffer_tensor.copy_(accumulated_buffers[name])
 
-        return query_losses.mean().item(), query_metrics.mean().item()
+        return query_loss, query_metric
 
-    # =========================================================================
-    # 2. Deployment / Inference Logic
-    # =========================================================================
-    def adapt_and_update(self, Xsupport: torch.Tensor, Ysupport: Dict[str, torch.Tensor], **kwargs) -> None:
+    def adapt_and_update(
+        self,
+        Xsupport: torch.Tensor,
+        Ysupport: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        **kwargs: Any,
+    ) -> None:
         """
         Adapts parameters and buffers on the provided support set and permanently updates `self.model`.
         Intended exclusively for test-time adaptation or deployment in Reptile.
 
         Args:
-            Xsupport (torch.Tensor): Support set inputs tensor of shape (num_tasks, K, ...).
-            Ysupport (Dict[str, torch.Tensor]): Support set target dictionary containing labels/masks.
+            Xsupport (torch.Tensor): Support set inputs tensor of shape `(num_tasks, K, ...)`.
+            Ysupport (Union[torch.Tensor, Dict[str, torch.Tensor]]): Support target label structure.
             **kwargs: Operational arguments passed down to loss modules and model forward pass.
         """
-        # Helper function to recursively transfer tensors or dictionaries to target compute device
+        # Device migration helper
         def to_device(obj, device):
             if isinstance(obj, torch.Tensor):
                 return obj.to(device)
@@ -262,70 +429,96 @@ class Reptile(MetaOptimizer):
                 return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in obj.items()}
             return obj
 
-        # Transfer support dataset inputs and labels to the designated device
+        # Transfer support dataset to compute device
         Xsupport = to_device(Xsupport, self.device)
         Ysupport = to_device(Ysupport, self.device)
 
-        # Extract current model state split into static parameters, persistent buffers, and initial fast weights
+        # Extract current model state split
         static_params, all_buffers, initial_fast_weights = self._extract_model_states()
 
-        # Define single-task adaptation closure compatible with torch.func.vmap
+        # Single-task adaptation closure compatible with torch.func.vmap
         def _adapt_single_task(x_s, y_s, global_buffers):
-            # Create an isolated clone of model buffers for this specific task to enable vmap parallelization
             task_buffers = {k: v.clone() for k, v in global_buffers.items()}
-            
-            # Initialize task-specific fast weights dictionary
             fast_weights = OrderedDict(initial_fast_weights)
-            
-            # Initialize task-specific inner optimizer state
             opt_state = self.inner_optimizer.init_state(fast_weights)
-            
-            # Execute inner adaptation steps using standard SGD/inner optimizer towards task manifold
-            for inner_step in range(self.num_inner_steps):
-                # Compute support gradients using first-order autograd
-                grads = self.inner_step_fn(
-                    fast_weights, static_params, task_buffers, 
-                    x_s, y_s, inner_step=inner_step, training=True, **kwargs
-                )
-                # Update task-specific fast weights via the inner optimizer
-                fast_weights, opt_state = self.inner_optimizer(
-                    fast_weights=fast_weights, gradients=grads, state=opt_state, step=inner_step
+
+            # Re-index labels if encoder is present
+            if isinstance(y_s, dict) and "labels" in y_s and self.encoder is not None:
+                y_s_enc, _ = self.encoder(y_s["labels"], y_s["labels"])
+                y_s = {**y_s, "labels": y_s_enc}
+
+            is_zero_shot = x_s.shape[0] == 0
+
+            if not is_zero_shot:
+                # Execute inner adaptation steps towards task manifold
+                for inner_step in range(self.num_inner_steps):
+
+                    grads, updated_task_buffers = self.inner_step_fn(
+                        fast_weights,
+                        static_params,
+                        task_buffers,
+                        x_s,
+                        y_s,
+                        inner_step=inner_step,
+                        training=True,
+                        **kwargs,
+                    )
+
+                    task_buffers = {k: v.detach() for k, v in updated_task_buffers.items()}
+
+                    fast_weights, opt_state = self.inner_optimizer(
+                        fast_weights=fast_weights,
+                        gradients=grads,
+                        state=opt_state,
+                        step=inner_step,
+                        training=False
+                    )
+
+            # Capture finalized buffers
+            combined = {**fast_weights, **static_params, **task_buffers}
+            with torch.no_grad():
+                _, out_dict = self.compute_loss(
+                    X=x_s,
+                    Y=y_s,
+                    model_states=combined,
+                    loss_module=self.support_loss_fn,
+                    inner_step=self.num_inner_steps,
+                    training=False,
+                    **kwargs,
                 )
 
-            # Combine adapted fast weights with static parameters and updated task buffers
-            combined = {**fast_weights, **static_params, **task_buffers}
-            
-            # Execute final functional pass to capture updated task buffers (e.g., BatchNorm, running_prototypes)
-            _, out_dict = self.compute_loss(
-                X=x_s, Y=y_s, model_states=combined,
-                loss_module=self.support_loss_fn,
-                inner_step=self.num_inner_steps,
-                training=False, **kwargs
-            )
-            
-            # Extract updated buffers dictionary from forward output, falling back to task_buffers if empty
             raw_buffers = out_dict.get("buffers", task_buffers)
             updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
-            # Return adapted weights and updated task buffers for batch aggregation
             return fast_weights, updated_task_buffers
 
-        # Vectorize single-task adaptation execution across the task batch dimension
-        vectorized_adapt = vmap(_adapt_single_task, in_dims=(0, 0, None), chunk_size=self.chunk_size)
-        
-        # Execute vectorized adaptation across all support tasks simultaneously
+        # Vectorize single-task adaptation across the batch dimension
+        vectorized_adapt = vmap(
+            _adapt_single_task,
+            in_dims=(0, 0, None),
+            chunk_size=self.chunk_size,
+            randomness="different",
+        )
+
+        # Execute parallel adaptation across all support tasks
         fast_weights_batched, batched_buffers = vectorized_adapt(Xsupport, Ysupport, all_buffers)
 
-        # Permanently copy adapted parameters and task-averaged buffers back to the base model
+        # Permanently copy adapted parameters and task-averaged buffers back to base model
         with torch.no_grad():
-            # Update trainable model parameters with mean adapted values across tasks
             for name, param in self.model.named_parameters():
                 if name in fast_weights_batched:
                     param.copy_(fast_weights_batched[name].mean(dim=0))
 
-            # Update persistent model buffers with mean updated values across tasks
             for name, buffer_tensor in self.model.named_buffers():
                 if name in batched_buffers:
-                    buffer_tensor.copy_(batched_buffers[name].mean(dim=0))
+                    buf = batched_buffers[name]
+                    if buf.dtype == torch.bool:
+                        buffer_tensor.copy_(buf.any(dim=0))
+                    else:
+                        buffer_tensor.copy_(buf.mean(dim=0))
+
+        # Clear GPU allocation cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         print("✅ Reptile: Model parameters and running buffers successfully adapted and updated.")
