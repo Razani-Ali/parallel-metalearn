@@ -98,11 +98,12 @@ class ProtoNet_Model(nn.Module):
             feat_s_flat = feat_s.flatten(start_dim=-1) if feat_s.dim() > 2 else feat_s
 
             # Apply dropout regularization on support features
-            feat_s_flat = torch.nn.functional.dropout(
-                feat_s_flat, 
-                p=self.drop_rate, 
-                training=dropout_training
-            )
+            if self.drop_rate > 0.0:
+                feat_s_flat = torch.nn.functional.dropout(
+                    feat_s_flat, 
+                    p=self.drop_rate, 
+                    training=dropout_training
+                )
 
             # Unpack ground-truth labels and optional sample validity masks
             labels_s = y_s["labels"]
@@ -141,11 +142,12 @@ class ProtoNet_Model(nn.Module):
         feat_q_flat = feat_q.flatten(start_dim=-1) if feat_q.dim() > 2 else feat_q
 
         # Apply dropout regularization on query features
-        feat_q_flat = torch.nn.functional.dropout(
-            feat_q_flat, 
-            p=self.drop_rate, 
-            training=dropout_training
-        )
+        if self.drop_rate > 0.0:
+            feat_q_flat = torch.nn.functional.dropout(
+                feat_q_flat, 
+                p=self.drop_rate, 
+                training=dropout_training
+            )
 
         # 3. Calculate classification logits via distance metric module
         logits = self.distance_module(queries=feat_q_flat, prototypes=prototypes, class_mask=class_mask)

@@ -340,20 +340,27 @@ class MetaTrain:
 
         pbar = tqdm(range(trials), desc="🧪 Meta-Testing", leave=False, dynamic_ncols=True)
 
-        for _ in pbar:
+        for step_idx in pbar:
             # Run non-training evaluation step
             loss, metric = self.algorithm.step(Loader, training=False, **kwargs)
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            total_loss += loss / trials
-            total_metric += metric / trials
-            
-            pbar.set_postfix({'Avg-Loss': f"{total_loss:.4f}", 'Avg-Acc': f"{total_metric * 100:.2f}%"})
+            total_loss += loss
+            total_metric += metric
+
+            running_loss = total_loss / (step_idx + 1)
+            running_metric = total_metric / (step_idx + 1)
+
+            pbar.set_postfix({
+                'Avg-Loss': f"{running_loss:.4f}", 
+                'Avg-Acc': f"{running_metric * 100:.2f}%"
+            })
 
         pbar.close()
-        return total_loss, total_metric
+
+        return total_loss / trials, total_metric / trials
 
     def adapt2task(self, Loader: Any, **kwargs: Any) -> None:
         """

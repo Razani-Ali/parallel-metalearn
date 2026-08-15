@@ -154,11 +154,12 @@ class ProtoMAML_Model(nn.Module):
         else:
             features_flat = features
 
-        features_flat = torch.nn.functional.dropout(
-            features_flat, 
-            p=self.drop_rate, 
-            training=dropout_training
-        )
+        if self.drop_rate > 0.0:
+            features_flat = torch.nn.functional.dropout(
+                features_flat, 
+                p=self.drop_rate, 
+                training=dropout_training
+            )
 
         # Evaluate logits via classification linear head
         logits = self.head(features_flat)
