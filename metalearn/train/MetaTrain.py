@@ -255,7 +255,9 @@ class MetaTrain:
                 'Tr-Loss': f"{train_loss:.4f}",
                 'Tr-Acc': f"{train_metric * 100:.1f}%",
                 'Val-Loss': last_val_loss_str,
-                'Val-Acc': last_val_acc_str
+                'Val-Acc': last_val_acc_str,
+                "Best Vall-Acc": best_val_metric,
+                "Best Epoch": best_epoch,
             })
 
             # --- 4. Model Selection & Early Stopping ---

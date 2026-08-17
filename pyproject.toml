@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallel-metalearn"
-version = "0.4.3"
+version = "0.4.4"
 description = "A high-performance, vmap-accelerated functional meta-learning framework built natively on PyTorch."
 readme = "README.md"
 requires-python = ">=3.10"
