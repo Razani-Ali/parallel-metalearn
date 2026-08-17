@@ -147,6 +147,11 @@ class SimplePrototype(BasePrototype):
         num_samples = features.shape[0]
         device = features.device
         num_step = kwargs.get('inner_step', 0)
+
+        if features.dim() > 2:
+            features = features.flatten(start_dim=1)
+        else:
+            features = features
         
         if isinstance(num_step, int):
             step_idx = min(num_step, self.max_inner_steps - 1)
@@ -196,13 +201,14 @@ class SimplePrototype(BasePrototype):
             valid_one_hot = one_hot
 
         # Calculate valid sample count per class category: shape [max_classes, 1]
-        class_counts = valid_one_hot.sum(dim=0, keepdim=True).T
+        class_counts = valid_one_hot.sum(dim=-2, keepdim=True).mT
+        class_counts = torch.clamp(class_counts, min=1.0)
 
         # Aggregate feature vectors per class category via matrix multiplication: shape [max_classes, latent_dim]
-        class_sums = torch.matmul(valid_one_hot.T, features)
+        class_sums = torch.matmul(valid_one_hot.mT, features)
 
         # Compute mean class centroids using safe element-wise division (clamping prevents zero-division)
-        centroids = class_sums / class_counts.clamp(min=1)
+        centroids = class_sums / class_counts
 
         # Construct boolean validity mask indicating present active classes (sample count > 0)
         mask = (class_counts.squeeze(-1) > 0)

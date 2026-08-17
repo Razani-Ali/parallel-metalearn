@@ -104,7 +104,7 @@ class ProtoMAML_Model(nn.Module):
         features = torch.func.functional_call(self.backbone, backbone_states, (x_s,), forward_kwargs)
 
         if features.dim() > 2:
-            features_flat = features.flatten(start_dim=-1)
+            features_flat = features.flatten(start_dim=1)
         else:
             features_flat = features
 
@@ -155,7 +155,7 @@ class ProtoMAML_Model(nn.Module):
         dropout_training = kwargs.get('training', self.training)
 
         if features.dim() > 2:
-            features_flat = features.flatten(start_dim=-1)
+            features_flat = features.flatten(start_dim=1)
         else:
             features_flat = features
 

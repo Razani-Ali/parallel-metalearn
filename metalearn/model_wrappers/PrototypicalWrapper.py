@@ -95,7 +95,7 @@ class ProtoNet_Model(nn.Module):
             feat_s = self.backbone(x_s, **kwargs)
 
             # Flatten feature representation if dimensional rank > 2
-            feat_s_flat = feat_s.flatten(start_dim=-1) if feat_s.dim() > 2 else feat_s
+            feat_s_flat = feat_s.flatten(start_dim=1) if feat_s.dim() > 2 else feat_s
 
             # Apply dropout regularization on support features
             if self.drop_rate > 0.0:
@@ -139,7 +139,7 @@ class ProtoNet_Model(nn.Module):
         feat_q = self.backbone(x_q, **kwargs)
 
         # Flatten query feature representation if dimensional rank > 2
-        feat_q_flat = feat_q.flatten(start_dim=-1) if feat_q.dim() > 2 else feat_q
+        feat_q_flat = feat_q.flatten(start_dim=1) if feat_q.dim() > 2 else feat_q
 
         # Apply dropout regularization on query features
         if self.drop_rate > 0.0:

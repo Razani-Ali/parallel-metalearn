@@ -79,7 +79,7 @@ class MAML_Model(nn.Module):
         dropout_training = kwargs.get('training', self.training)
 
         if features.dim() > 2:
-            features_flat = features.flatten(start_dim=-1)
+            features_flat = features.flatten(start_dim=1)
         else:
             features_flat = features
 
