@@ -256,7 +256,7 @@ class MetaTrain:
                 'Tr-Acc': f"{train_metric * 100:.1f}%",
                 'Val-Loss': last_val_loss_str,
                 'Val-Acc': last_val_acc_str,
-                "Best Vall-Acc": best_val_metric,
+                "Best Vall-Acc": f"{best_val_metric * 100:.1f}%",
                 "Best Epoch": best_epoch,
             })
 

@@ -520,17 +520,11 @@ class ProtoMAMLv2(MetaOptimizer):
             if not is_zero_shot:
                 # INNER LOOP ADAPTATION (Backbone representation learning)
                 for inner_step in range(self.num_inner_steps):
-                    # 🛠️ GHOST GRAPH FIX: Detach weights early for First-Order MAML
-                    is_first_order = getattr(self.inner_optimizer, "first_order", False)
-                    if is_first_order:
-                        fw_for_grad = {k: v.detach().requires_grad_(True) for k, v in fast_weights.items()}
-                    else:
-                        fw_for_grad = fast_weights
 
                     # Compute support gradients for backbone
                     # (Head weights are dynamically synthesized inside inner_step_fn)
                     grads, updated_task_buffers = self.inner_step_fn(
-                        fw_for_grad,
+                        fast_weights,
                         static_params,
                         task_buffers,
                         x_s,
