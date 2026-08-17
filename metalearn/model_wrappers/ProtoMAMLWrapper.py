@@ -103,13 +103,18 @@ class ProtoMAML_Model(nn.Module):
 
         features = torch.func.functional_call(self.backbone, backbone_states, (x_s,), forward_kwargs)
 
+        if features.dim() > 2:
+            features_flat = features.flatten(start_dim=-1)
+        else:
+            features_flat = features
+
         # 3. Extract target labels and optional samples validity mask from target dict
         labels = y_s["labels"]
         samples_mask = y_s.get("samples_mask", None)
 
         # 4. Compute masked prototypes with full gradient tracking back to features
         centroids, mask, center_bufs = self.center_head.compute_class_centers(
-            features=features, 
+            features=features_flat, 
             labels=labels, 
             samples_mask=samples_mask,
             task_buffers=task_buffers,
