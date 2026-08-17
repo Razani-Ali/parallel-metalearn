@@ -1,17 +1,24 @@
-import torch
-import itertools
-from typing import List, Tuple, Optional, Dict
 import random
+import itertools
+from typing import List, Tuple, Optional, Dict, Union, Any
 import numpy as np
+import torch
+from torch.utils.data import Dataset
 
+
+# ==============================================================================
+# 1. SYNCHRONIZED / POOLED FEW-SHOT SAMPLER (JOINT & DISJOINT SAMPLING)
+# ==============================================================================
 
 class FewShotSampler:
     """
-    Generic and Standalone Few-Shot Sampler for Meta-Learning Tasks.
+    Unified Few-Shot Sampler for Meta-Learning Tasks.
 
-    Decouples raw string dataset labels from integer-indexed targets (0, 1, ..., N-1) 
-    required by classification loss functions (e.g., CrossEntropyLoss). Operates 
-    on arbitrary-rank NumPy arrays where the first axis indexes samples.
+    Performs simultaneous and strictly disjoint sampling of Support and Query sets 
+    from a shared pool of class instances within each episode/task. Translates raw 
+    string dataset labels to integer-indexed classification targets (0, 1, ..., N-1).
+    Gracefully handles zero-shot support requests by returning empty tensors with 
+    preserved feature dimensionality.
     """
 
     def __init__(
@@ -27,15 +34,14 @@ class FewShotSampler:
             X_base (np.ndarray): Foundational feature tensor of shape [Total_Samples, ...].
             Y_base (np.ndarray): Master 1D array of original string (or object) labels.
             numeric_to_string (Dict[int, str]): Mapping translating numeric target IDs 
-                                                to string category labels in Y_base 
-                                                (e.g., {0: 'class_a', 1: 'class_b'}).
+                                                to string category labels in Y_base.
         """
         # Store foundational feature tensor and target labels
         self.X = X_base
         self.Y = Y_base
         self.numeric_to_string = numeric_to_string
         
-        # Build category-to-row-index mapping and calculate class capacities
+        # Build category-to-row-index mapping and calculate available instance counts
         self.indices_by_class = self._map_instances_to_classes()
         self.label_frequencies = self._calculate_label_frequencies()
 
@@ -48,7 +54,7 @@ class FewShotSampler:
         """
         mapping: Dict[str, List[int]] = {}
         for i, label in enumerate(self.Y):
-            # Convert label to string to ensure safe hash mapping
+            # Convert label to string to ensure consistent hash mapping
             label_str = str(label)
             if label_str not in mapping:
                 mapping[label_str] = []
@@ -60,7 +66,7 @@ class FewShotSampler:
         Calculates available sample count per category.
 
         Returns:
-            Dict[str, int]: Dictionary mapping string labels to sample capacities.
+            Dict[str, int]: Dictionary mapping string labels to total instance capacities.
         """
         return {
             label: len(indices) for label, indices in self.indices_by_class.items()
@@ -78,21 +84,23 @@ class FewShotSampler:
     def _validate_inputs(
         self, 
         target_numeric_classes: Tuple[int, ...], 
-        samples_per_class: Tuple[int, ...]
+        support_samples_per_class: Tuple[int, ...],
+        query_samples_per_class: Tuple[int, ...]
     ) -> None:
         """
-        Validates target class IDs and requested sample counts against database bounds.
+        Validates target class IDs and verifies that joint sample counts do not exceed capacity.
 
         Args:
             target_numeric_classes (Tuple[int, ...]): Requested target numeric IDs.
-            samples_per_class (Tuple[int, ...]): Requested sample count per class ID.
+            support_samples_per_class (Tuple[int, ...]): Support sample counts per class ID.
+            query_samples_per_class (Tuple[int, ...]): Query sample counts per class ID.
         """
         # Ensure dimensions match between class IDs and requested sample counts
-        if len(target_numeric_classes) != len(samples_per_class):
-            raise ValueError("❌ Shape Mismatch: Length of target classes must match samples per class!")
+        if not (len(target_numeric_classes) == len(support_samples_per_class) == len(query_samples_per_class)):
+            raise ValueError("❌ Shape Mismatch: Length of target classes, support counts, and query counts must match!")
 
-        # Validate existence and capacity for each requested class
-        for num_label, required_samples in zip(target_numeric_classes, samples_per_class):
+        # Validate existence and total joint capacity for each requested class
+        for num_label, s_count, q_count in zip(target_numeric_classes, support_samples_per_class, query_samples_per_class):
             if num_label not in self.numeric_to_string:
                 raise KeyError(f"❌ Map Error: Numeric class ID '{num_label}' is missing from numeric_to_string map!")
             
@@ -101,38 +109,54 @@ class FewShotSampler:
                 raise KeyError(f"❌ Label Error: Target class label '{string_name}' was not found in dataset!")
                 
             available_count = self.label_frequencies[string_name]
-            if available_count < required_samples:
+            total_requested = s_count + q_count
+            if available_count < total_requested:
                 raise ValueError(
                     f"❌ Capacity Exceeded: Class '{string_name}' has {available_count} samples, "
-                    f"which is less than the requested {required_samples} samples!"
+                    f"which is less than the requested joint count of {total_requested} (Support: {s_count} + Query: {q_count})!"
                 )
 
     def _sample_single_class(
         self, 
         num_label: int, 
-        required_samples: int
-    ) -> Tuple[List[np.ndarray], List[int]]:
+        s_count: int,
+        q_count: int
+    ) -> Tuple[List[np.ndarray], List[int], List[np.ndarray], List[int]]:
         """
-        Samples a specified number of instances randomly for a single numeric class ID.
+        Jointly samples disjoint Support and Query instances without replacement for a single class.
 
         Args:
             num_label (int): Target numeric class ID.
-            required_samples (int): Number of instances to sample.
+            s_count (int): Number of support instances to draw (can be 0).
+            q_count (int): Number of query instances to draw.
 
         Returns:
-            Tuple[List[np.ndarray], List[int]]: Lists of sampled X arrays and integer Y labels.
+            Tuple containing:
+                - Support feature arrays
+                - Support integer labels
+                - Query feature arrays
+                - Query integer labels
         """
         string_name = str(self.numeric_to_string[num_label])
         available_indices = self.indices_by_class[string_name]
         
-        # Draw random row indices without replacement
-        chosen_indices = random.sample(available_indices, required_samples)
+        # Draw total required indices without replacement (guarantees intra-task disjointness)
+        total_needed = s_count + q_count
+        chosen_indices = random.sample(available_indices, total_needed)
 
-        # Extract features and assign numeric target integer ID
-        sampled_x = [self.X[idx] for idx in chosen_indices]
-        sampled_y = [num_label] * required_samples
+        # Partition indices into distinct Support and Query subsets
+        support_indices = chosen_indices[:s_count]
+        query_indices = chosen_indices[s_count:total_needed]
 
-        return sampled_x, sampled_y
+        # Extract features and assign numeric target integer ID for support
+        s_x = [self.X[idx] for idx in support_indices]
+        s_y = [num_label] * s_count
+
+        # Extract features and assign numeric target integer ID for query
+        q_x = [self.X[idx] for idx in query_indices]
+        q_y = [num_label] * q_count
+
+        return s_x, s_y, q_x, q_y
 
     def _post_process_and_shuffle(
         self, 
@@ -140,7 +164,8 @@ class FewShotSampler:
         s_y: List[int]
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Integrates, shuffles, and formats sampled features and target labels.
+        Integrates, shuffles, and formats sampled features and target labels into NumPy arrays.
+        Safely returns empty arrays with exact feature dimensions if s_x is empty.
 
         Args:
             s_x (List[np.ndarray]): List of sampled feature matrices.
@@ -149,6 +174,11 @@ class FewShotSampler:
         Returns:
             Tuple[np.ndarray, np.ndarray]: Shuffled feature tensor (X) and 1D label array (Y).
         """
+        if len(s_x) == 0:
+            # Handle empty partition safely while preserving feature shape and datatypes
+            feature_shape = self.X.shape[1:]
+            return np.empty((0, *feature_shape), dtype=self.X.dtype), np.empty((0,), dtype=np.int64)
+
         # Pair features and labels for synchronized shuffling
         combined = list(zip(s_x, s_y))
         random.shuffle(combined)
@@ -162,76 +192,63 @@ class FewShotSampler:
     def sample(
         self, 
         target_numeric_classes: Tuple[int, ...], 
-        samples_per_class: Tuple[int, ...]
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        support_samples_per_class: Tuple[int, ...],
+        query_samples_per_class: Tuple[int, ...]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Orchestrates the sampling pipeline to extract N-way K-shot task batches.
+        Orchestrates joint task sampling, outputting disjoint Support and Query batches.
 
         Args:
             target_numeric_classes (Tuple[int, ...]): Tuple of target class integer IDs (e.g., (0, 1, 2)).
-            samples_per_class (Tuple[int, ...]): Parallel tuple of sample counts per ID (e.g., (5, 5, 5)).
+            support_samples_per_class (Tuple[int, ...]): Support sample counts per ID (e.g., (5, 5, 5) or (0, 0, 0)).
+            query_samples_per_class (Tuple[int, ...]): Query sample counts per ID (e.g., (4, 4, 4)).
 
         Returns:
-            Tuple[np.ndarray, np.ndarray]:
-                - X_final: Task feature tensor of shape [Total_Sampled, ...].
-                - Y_final: 1D NumPy int64 array of numeric target labels [Total_Sampled].
+            Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                - X_s_final: Support feature tensor [Total_Support_Samples, ...].
+                - Y_s_final: Support label array [Total_Support_Samples].
+                - X_q_final: Query feature tensor [Total_Query_Samples, ...].
+                - Y_q_final: Query label array [Total_Query_Samples].
         """
-        # Validate input parameters and dataset limits
-        self._validate_inputs(target_numeric_classes, samples_per_class)
+        # Validate inputs against bounds and capacities
+        self._validate_inputs(target_numeric_classes, support_samples_per_class, query_samples_per_class)
 
-        all_sampled_x: List[np.ndarray] = []
-        all_sampled_y: List[int] = []
+        all_s_x: List[np.ndarray] = []
+        all_s_y: List[int] = []
+        all_q_x: List[np.ndarray] = []
+        all_q_y: List[int] = []
 
-        # Sample instances class by class
-        for num_label, required_samples in zip(target_numeric_classes, samples_per_class):
-            x_c, y_c = self._sample_single_class(num_label, required_samples)
-            all_sampled_x.extend(x_c)
-            all_sampled_y.extend(y_c)
+        # Sample disjoint support and query instances class by class
+        for num_label, s_count, q_count in zip(target_numeric_classes, support_samples_per_class, query_samples_per_class):
+            s_x_c, s_y_c, q_x_c, q_y_c = self._sample_single_class(num_label, s_count, q_count)
+            all_s_x.extend(s_x_c)
+            all_s_y.extend(s_y_c)
+            all_q_x.extend(q_x_c)
+            all_q_y.extend(q_y_c)
 
-        # Shuffle and return formatted output arrays
-        return self._post_process_and_shuffle(all_sampled_x, all_sampled_y)
+        # Post-process, shuffle, and format each subset independently
+        X_s_final, Y_s_final = self._post_process_and_shuffle(all_s_x, all_s_y)
+        X_q_final, Y_q_final = self._post_process_and_shuffle(all_q_x, all_q_y)
+
+        return X_s_final, Y_s_final, X_q_final, Y_q_final
 
 
 # ==============================================================================
-# DEVELOPER NOTE: EXTENDING FOR MULTITASK LEARNING (REGRESSION / AUXILIARY TARGETS)
+# 2. SYNCHRONIZED META-TASK DATASET
 # ==============================================================================
-# To support Multi-Task Learning (e.g., joint Classification and Regression),
-# you can easily inject an auxiliary targets array (e.g., continuous metrics,
-# auxiliary labels) synchronized 1-to-1 with the first axis of X_base and Y_base.
-#
-# Implementation Steps:
-# 1. Update __init__: Accept `reg_base: Optional[np.ndarray] = None` and store `self.reg = reg_base`.
-# 2. Update `_sample_single_class`:
-#    When indexing chosen samples via `chosen_indices`, slice `self.reg` directly:
-#        if self.reg is not None:
-#            sampled_reg.append(self.reg[idx])
-# 3. Update `_post_process_and_shuffle`:
-#    Include `sampled_reg` in `zip(s_x, s_y, s_reg)` before shuffling to guarantee
-#    synchronous shuffling across all modalities, then format into numpy array:
-#        Reg_final = np.array([item[2] for item in combined])
-# 4. Update `sample`: Return `(X_final, Y_final, Reg_final)` tuple.
-# ==============================================================================
-
-
-import random
-import torch
-import numpy as np
-from torch.utils.data import Dataset
-from typing import List, Tuple, Union, Optional, Any
-
 
 class MetaTaskDataset(Dataset):
     """
-    A PyTorch Dataset that generates single Few-Shot Learning tasks.
+    A PyTorch Dataset that generates single Few-Shot Learning tasks using a single 
+    synchronized sampler to ensure strictly disjoint support and query partitions.
     
-    Task batching (stacking across the task dimension) is delegated 
-    to PyTorch's DataLoader via the `batch_size` argument.
+    Fully supports 0-shot support evaluation with dimension-safe empty tensor outputs.
+    Task batching across episodes is delegated to PyTorch's DataLoader via `batch_size`.
     """
 
     def __init__(
         self,
-        support_sampler: Any,
-        query_sampler: Any,
+        sampler: Optional[FewShotSampler] = None,
         way: Union[int, Tuple[int, int]] = 5,
         support_shot: Union[int, Tuple[int, int]] = 1,
         query_shot: Union[int, Tuple[int, int]] = 15,
@@ -242,16 +259,14 @@ class MetaTaskDataset(Dataset):
         Initializes the MetaTaskDataset.
 
         Args:
-            support_sampler (Any): Instance of FewShotSampler for support sets.
-            query_sampler (Any): Instance of FewShotSampler for query sets.
+            sampler (Optional[FewShotSampler]): Synchronized sampler managing the shared data pool.
             way (Union[int, Tuple[int, int]]): Number of classes per task (fixed int or (min, max) tuple).
-            support_shot (Union[int, Tuple[int, int]]): Support samples per class (fixed or tuple).
+            support_shot (Union[int, Tuple[int, int]]): Support samples per class (fixed or tuple, can be 0).
             query_shot (Union[int, Tuple[int, int]]): Query samples per class (fixed or tuple).
             max_classes (Optional[int]): Maximum available classes if tasks_pool is None.
             tasks_pool (Optional[List[Tuple[int, ...]]]): Predefined list of class ID tuples.
         """
-        self.support_sampler = support_sampler
-        self.query_sampler = query_sampler
+        self.sampler = sampler
         self.tasks_pool = tasks_pool
         self.way = way
         self.support_shot = support_shot
@@ -273,17 +288,16 @@ class MetaTaskDataset(Dataset):
 
         self.max_support_samples = self.max_way * self.max_s_shot
         self.max_query_samples = self.max_way * self.max_q_shot
-        
 
     def __len__(self) -> int:
         """
-        Returns an arbitrarily large number to keep the DataLoader yielding tasks.
+        Returns an arbitrarily large number to keep the DataLoader yielding continuous episodic tasks.
         """
         return int(416667)
 
     def _resolve_param_value(self, param: Union[int, Tuple[int, int]]) -> int:
         """
-        Resolves a single parameter value that might be a fixed int or a random range (min, max).
+        Resolves a single parameter value that might be a fixed integer or a random range (min, max).
         """
         if isinstance(param, tuple) and len(param) == 2:
             return random.randint(param[0], param[1])
@@ -320,7 +334,7 @@ class MetaTaskDataset(Dataset):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Pads feature and label arrays to target_max_samples using dummy data 
-        and constructs a boolean mask tensor (1.0 for valid, 0.0 for dummy).
+        and constructs a boolean mask tensor (True for valid, False for dummy).
         """
         num_real_samples = len(x_arr)
         
@@ -337,11 +351,11 @@ class MetaTaskDataset(Dataset):
             x_dummy = torch.zeros(x_pad_shape, dtype=x_tensor.dtype)
             x_final = torch.cat([x_tensor, x_dummy], dim=0)
 
-            # Pad Y labels with -1 (or 0)
+            # Pad Y labels with -1
             y_dummy = torch.full((pad_count,), fill_value=-1, dtype=y_tensor.dtype)
             y_final = torch.cat([y_tensor, y_dummy], dim=0)
 
-            # Construct binary mask (1.0 for real data, 0.0 for padding)
+            # Construct binary mask (True for real data, False for padding)
             mask = torch.cat([
                 torch.ones(num_real_samples, dtype=torch.bool),
                 torch.zeros(pad_count, dtype=torch.bool)
@@ -376,13 +390,17 @@ class MetaTaskDataset(Dataset):
         # Sample random combination from available classes
         return tuple(random.sample(self.available_classes, current_way))
 
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Generates a SINGLE task.
+        Generates a SINGLE few-shot task with strictly disjoint support and query partitions.
+        Handles zero support samples cleanly with correct tensor dimensions.
         
         Returns:
-            Tuple of 4 tensors (x_support, y_support, x_query, y_query) for one task.
+            Tuple containing:
+                - x_s (torch.Tensor): Support features tensor [Max_Support_Samples, ...]
+                - y_s_dict (Dict[str, torch.Tensor]): Support target labels and optional mask
+                - x_q (torch.Tensor): Query features tensor [Max_Query_Samples, ...]
+                - y_q_dict (Dict[str, torch.Tensor]): Query target labels and optional mask
         """
         # Determine number of classes for this task
         current_way = self._resolve_param_value(self.way)
@@ -392,19 +410,31 @@ class MetaTaskDataset(Dataset):
         s_samples_per_class = self._resolve_shot_per_class(self.support_shot, current_way)
         q_samples_per_class = self._resolve_shot_per_class(self.query_shot, current_way)
 
-        # Sample raw numpy instances
-        if self.support_sampler is None or sum(s_samples_per_class) == 0:
-            # Construct empty dummy support tensors matching signal shape
-            sample_x, _ = self.query_sampler.sample(target_classes[:1], (1,))
-            feature_shape = sample_x.shape[1:]
-            
-            x_s_raw = np.empty((0, *feature_shape), dtype=sample_x.dtype)
+        # Jointly sample disjoint support and query instances from the single unified sampler
+        if self.sampler is None or sum(s_samples_per_class) == 0:
+            # Zero support scenario: query only
+            if self.sampler is not None:
+                # Query samples with 0 support samples requested
+                _, _, x_q_raw, y_q_raw = self.sampler.sample(
+                    target_classes, 
+                    (0,) * current_way, 
+                    q_samples_per_class
+                )
+                feature_shape = self.sampler.X.shape[1:]
+                feature_dtype = self.sampler.X.dtype
+            else:
+                raise ValueError("❌ Error: Sampler must not be None when query shots are requested.")
+
+            # Create an empty support array preserving feature dimensionality
+            x_s_raw = np.empty((0, *feature_shape), dtype=feature_dtype)
             y_s_raw = np.empty((0,), dtype=np.int64)
 
         else:
-            x_s_raw, y_s_raw, *_ = self.support_sampler.sample(target_classes, s_samples_per_class)
-            
-        x_q_raw, y_q_raw, *_ = self.query_sampler.sample(target_classes, q_samples_per_class)
+            x_s_raw, y_s_raw, x_q_raw, y_q_raw = self.sampler.sample(
+                target_classes, 
+                s_samples_per_class, 
+                q_samples_per_class
+            )
 
         # Pad and construct mask dictionaries
         x_s, y_s_dict = self._pad_and_mask(x_s_raw, y_s_raw, self.max_support_samples)
@@ -414,7 +444,7 @@ class MetaTaskDataset(Dataset):
 
     def reset_rng(self, seed: int) -> None:
         """
-        Resets random seeds across Python, NumPy, PyTorch, and internal samplers.
+        Resets random seeds across Python, NumPy, PyTorch, and the underlying sampler.
         """
         random.seed(seed)
         np.random.seed(seed)
@@ -423,73 +453,5 @@ class MetaTaskDataset(Dataset):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
             
-        self.support_sampler.reset_seed(seed)
-        self.query_sampler.reset_seed(seed)
-
-
-# ==============================================================================
-# DEVELOPER NOTE: EXTENDING MetaTaskDataset FOR MULTITASK / SEGMENTATION
-# ==============================================================================
-# If your downstream task requires auxiliary target tensors synchronized with X and Y
-# (e.g., Semantic Segmentation masks, bounding boxes, continuous target matrices),
-# follow these 3 simple modifications in MetaTaskDataset:
-#
-# 1. Update `_sample_single_task`:
-#    Unpack the extra metadata or auxiliary tensors returned by `FewShotSampler` 
-#    instead of discarding them with `*_`:
-#
-#        # Before: x_s, y_s, *_ = self.support_sampler.sample(...)
-#        # After:  x_s, y_s, mask_s = self.support_sampler.sample(...)
-#        #         x_q, y_q, mask_q = self.query_sampler.sample(...)
-#
-# 2. Convert Auxiliary Outputs to PyTorch Tensors:
-#    Convert the sampled auxiliary arrays alongside X and Y in `_sample_single_task`:
-#
-#        return (
-#            torch.from_numpy(x_s),
-#            torch.from_numpy(y_s),
-#            torch.from_numpy(mask_s),  # Auxiliary Support Tensor (e.g., Segmentation Mask)
-#            torch.from_numpy(x_q),
-#            torch.from_numpy(y_q),
-#            torch.from_numpy(mask_q)   # Auxiliary Query Tensor
-#        )
-#
-# 3. Update `__getitem__` Return Signature:
-#    Return the expanded tuple of 6 tensors:
-#    `return self._sample_single_task(target_classes, s_samples_per_class, q_samples_per_class)`
-#
-# Note: PyTorch DataLoader will automatically handle batching (stacking across dim 0)
-# for all 6 returned tensors without requiring any changes to batching logic.
-# ==============================================================================
-
-
-
-# ==============================================================================
-# DEVELOPER NOTE: EXTENDING SAMPLER & DATASET FOR DOMAIN ADAPTATION (DA)
-# ==============================================================================
-# To pass domain labels/tensors directly to your DomainAdaptiveLoss:
-#
-# 1. FewShotSampler:
-#    Accept an optional `domain_base: Optional[np.ndarray] = None` in __init__.
-#    Include domain arrays in the synchronous `random.shuffle` step to preserve 
-#    1-to-1 alignment with X and Y.
-#
-# 2. MetaTaskDataset:
-#    Unpack domain outputs from both support_sampler and query_sampler:
-#        x_s, y_s, d_s = self.support_sampler.sample(...)
-#        x_q, y_q, d_q = self.query_sampler.sample(...)
-#
-#    Return 6 tensors from `__getitem__`:
-#        return x_s, y_s, d_s, x_q, y_q, d_q
-#
-# 3. Do NOT modify MAML.py or InnerSGD.
-#
-# 4. Ensure your model wrapper returns feature maps in `out_dict["features"]`.
-#
-# 5. Create a custom `BaseLoss` subclass that computes both classification loss 
-#    and domain alignment loss (e.g., MMD distance between source/target features):
-#
-#    total_loss = classification_loss + lambda_da * domain_alignment_loss
-#
-# 6. Pass this custom loss module as `query_loss_fn` or `support_loss_fn` to MAML.
-# ==============================================================================
+        if self.sampler is not None:
+            self.sampler.reset_seed(seed)
