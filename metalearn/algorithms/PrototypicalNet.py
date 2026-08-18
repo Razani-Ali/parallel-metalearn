@@ -2,8 +2,8 @@ from typing import Dict, Optional, Tuple, Union, Callable, Any
 import torch
 from torch.func import vmap
 from metalearn.loss.base import BaseLoss
-from .BaseLearner import MetaOptimizer
-from ..model_wrappers.PrototypicalWrapper import ProtoNet_Model
+from metalearn.algorithms.BaseLearner import MetaOptimizer
+from metalearn.model_wrappers.PrototypicalWrapper import ProtoNet_Model
 
 
 # ==============================================================================

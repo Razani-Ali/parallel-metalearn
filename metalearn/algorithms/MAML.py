@@ -2,8 +2,8 @@ from collections import OrderedDict
 from typing import Dict, Optional, Tuple, Union, Callable
 import torch
 from metalearn.loss.base import BaseLoss
-from .BaseLearner import MetaOptimizer
-from .MetaUtils import get_per_step_loss_weights
+from metalearn.algorithms.BaseLearner import MetaOptimizer
+from metalearn.algorithms.MetaUtils import get_per_step_loss_weights
 from metalearn.inner_optimizers.base import BaseInnerOptimizer
 from torch.func import grad, vmap
 from metalearn.model_wrappers.MAMLWrapper import MAML_Model

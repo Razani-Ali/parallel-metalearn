@@ -1,8 +1,8 @@
 import torch.nn as nn
 import copy
-from .basic_layers.BatchNormalization import BatchNorm
-from .basic_layers.GRU import *
-from .basic_layers.LSTM import *
+from metalearn.nn_models.basic_layers.BatchNormalization import BatchNorm
+from metalearn.nn_models.basic_layers.GRU import *
+from metalearn.nn_models.basic_layers.LSTM import *
 
 
 class ModelTranslator:

@@ -2,7 +2,7 @@ from collections import OrderedDict
 from typing import Dict, Tuple
 import torch
 import torch.utils._pytree as pytree
-from .base import BaseInnerOptimizer
+from metalearn.inner_optimizers.base import BaseInnerOptimizer
 
 
 class InnerSGD(BaseInnerOptimizer):

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .base import BaseMetric
+from metalearn.loss.base import BaseMetric
 
 
 class CategoricalAccuracy(BaseMetric):

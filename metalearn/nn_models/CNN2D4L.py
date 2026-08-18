@@ -1,5 +1,5 @@
 import torch.nn as nn
-from .basic_layers.BatchNormalization import BatchNorm
+from metalearn.nn_models.basic_layers.BatchNormalization import BatchNorm
 
 # model from:
 # S. Zhang, F. Ye, B. Wang and T. G. Habetler,

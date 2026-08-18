@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from metalearn.loss.base import BaseLoss
-from .categorical_accuracy import CategoricalAccuracy
+from metalearn.loss.categorical_accuracy import CategoricalAccuracy
 
 
 class CrossEntropy(BaseLoss):

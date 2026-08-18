@@ -4,7 +4,7 @@ import torch
 import torch.utils._pytree as pytree
 from torch.func import grad, vmap
 from metalearn.loss.base import BaseLoss
-from .BaseLearner import MetaOptimizer
+from metalearn.algorithms.BaseLearner import MetaOptimizer
 from metalearn.inner_optimizers.base import BaseInnerOptimizer
 from metalearn.model_wrappers.MAMLWrapper import MAML_Model
 from metalearn.loss import LabelEncoder

@@ -4,7 +4,7 @@ import tempfile
 import torch
 from typing import Dict, Tuple, Any, Optional
 from tqdm.auto import tqdm
-from .Utils import init_history, update_history, setup_logger, format_time
+from metalearn.train.Utils import init_history, update_history, setup_logger, format_time
 from metalearn.file_manager.FileHandle import remove_folder, safe_copy, replace_with_error
 from tqdm.auto import tqdm
 

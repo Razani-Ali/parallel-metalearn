@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, Union
-from .prototype_calculator import SimplePrototype, BasePrototype
-from ..distances.elastics import ElasticDistance
-from ..distances.classics import Euclidean, Distance
+from metalearn.model_wrappers.prototype_calculator import SimplePrototype, BasePrototype
+from metalearn.distances.elastics import ElasticDistance
+from metalearn.distances.classics import Euclidean, Distance
 
 
 class ProtoNet_Model(nn.Module):
@@ -23,6 +23,9 @@ class ProtoNet_Model(nn.Module):
         distance_module: Optional[Union[Distance, ElasticDistance]] = None,
         drop_rate: float = 0.0,
         prototype_class: Optional[BasePrototype] = None,
+        normalize_logits: bool = False,
+        normalize_p: float = 2.0,
+        use_temperature: bool = False,
         **kwargs
     ):
         """
@@ -35,6 +38,9 @@ class ProtoNet_Model(nn.Module):
             distance_module (Optional[Union[Distance, ElasticDistance]]): Distance metric module.
             drop_rate (float): Dropout probability.
             prototype_class (Optional[BasePrototype]): Custom prototype calculator.
+            normalize_logits (bool): normalize distances to each prototype (logits vector)
+            normalize_p (float): logits normalization p (nn.functional.normalize(..., p=normalize_p))
+            use_temperature (bool): logits vector coefficient. use with normalize_logits=True
             **kwargs: Additional operational flags such as 'keep_running_Prototype'.
         """
         super().__init__()
@@ -44,6 +50,11 @@ class ProtoNet_Model(nn.Module):
         self.latent_dim = latent_dim
         # Default to Euclidean distance if no custom metric module is provided
         self.distance_module = distance_module if distance_module else Euclidean()
+        self.normalize_logits = normalize_logits
+        self.use_temperature = use_temperature
+        self.p = normalize_p
+        if use_temperature:
+            self.alpha = nn.Parameter(torch.tensor(1.0), requires_grad=True)
         
         # Instantiate prototype extractor with per-step / running capabilities
         self.center_head = prototype_class if prototype_class else SimplePrototype(
@@ -151,6 +162,11 @@ class ProtoNet_Model(nn.Module):
 
         # 3. Calculate classification logits via distance metric module
         logits = self.distance_module(queries=feat_q_flat, prototypes=prototypes, class_mask=class_mask)
+
+        if self.normalize_logits:
+            logits = nn.functional.normalize(logits, dim=1, p=self.p)
+        if self.use_temperature:
+            logits = logits * self.alpha
 
         # Collect current model buffers and merge with updated prototype buffers
         current_buffers = dict(self.named_buffers())

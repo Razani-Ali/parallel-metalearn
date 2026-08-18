@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, Union, List
-from .prototype_calculator import SimplePrototype, BasePrototype
+from metalearn.model_wrappers.prototype_calculator import SimplePrototype, BasePrototype
 from collections import OrderedDict
 from metalearn.dataset.Scalers import BaseScaler
 
@@ -26,6 +26,8 @@ class ProtoMAML_Model(nn.Module):
         drop_rate: float = 0.0,
         prototype_class: Optional[BasePrototype] = None,
         fast_weights_names: Union[str, List[str], None] = None,
+        normalize_logits: bool = False,
+        use_temperature: bool = False,
         **kwargs,
     ):
         """
@@ -42,6 +44,8 @@ class ProtoMAML_Model(nn.Module):
                 - If None: Adapts all trainable parameters (standard).
                 - If "BIOL": Adapts only parameters in the `backbone` module.
                 - If List[str]: Adapts specific parameters matching the listed names.
+            normalize_logits (bool): normalize distances to each prototype (logits vector)
+            use_temperature (bool): logits vector coefficient. use with normalize_logits=True
             **kwargs: Additional keyword arguments.
         """
         # Initialize PyTorch parent module
@@ -49,6 +53,10 @@ class ProtoMAML_Model(nn.Module):
         # Store foundational feature extraction backbone
         self.scaler = scaler
         self.backbone = backbone
+        self.normalize_logits = normalize_logits
+        self.use_temperature = use_temperature
+        if use_temperature:
+            self.alpha = nn.Parameter(torch.tensor(1.0), requires_grad=True)
         
         # Instantiate non-parametric class center calculator
         self.center_head = prototype_class if prototype_class else SimplePrototype(max_classes=max_classes, latent_dim=latent_dim)
@@ -168,6 +176,11 @@ class ProtoMAML_Model(nn.Module):
 
         # Evaluate logits via classification linear head
         logits = self.head(features_flat)
+
+        if self.normalize_logits:
+            logits = nn.functional.normalize(logits, dim=1)
+        if self.use_temperature:
+            logits = logits * self.alpha
 
         # Return formatted prediction dictionary
         current_buffers = dict(self.named_buffers())
