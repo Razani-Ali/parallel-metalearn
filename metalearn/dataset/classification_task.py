@@ -254,6 +254,7 @@ class MetaTaskDataset(Dataset):
         query_shot: Union[int, Tuple[int, int]] = 15,
         max_classes: Optional[int] = None,
         tasks_pool: Optional[List[Tuple[int, ...]]] = None,
+        available_classes: Optional[List[int]] = None,
     ):
         """
         Initializes the MetaTaskDataset.
@@ -265,6 +266,7 @@ class MetaTaskDataset(Dataset):
             query_shot (Union[int, Tuple[int, int]]): Query samples per class (fixed or tuple).
             max_classes (Optional[int]): Maximum available classes if tasks_pool is None.
             tasks_pool (Optional[List[Tuple[int, ...]]]): Predefined list of class ID tuples.
+            available_classes (Optional[List[int]]): List of Available Classes (Default: list(range(N Ways)))
         """
         self.sampler = sampler
         self.tasks_pool = tasks_pool
@@ -274,13 +276,15 @@ class MetaTaskDataset(Dataset):
         self.imbalanced_shot = type(support_shot) == tuple or type(query_shot) == tuple
 
         # Set up available classes for random task generation if no predefined pool is provided
-        if self.tasks_pool is None:
-            if max_classes is None:
-                raise ValueError("Either tasks_pool or max_classes must be provided.")
+        if self.tasks_pool is not None:
+            self.available_classes = []
+        elif available_classes is not None:
+            self.available_classes = list(available_classes)
+        elif max_classes is not None:
             self.available_classes = list(range(max_classes))
         else:
-            self.available_classes = []
-
+            raise ValueError("Either tasks_pool, available_classes, or max_classes must be provided.")
+        
         # Determine upper bounds for static Tensor padding (critical for vmap compatibility)
         self.max_way = self.way[1] if isinstance(self.way, tuple) else int(self.way)
         self.max_s_shot = self.support_shot[1] if isinstance(self.support_shot, tuple) else int(self.support_shot)
@@ -388,6 +392,9 @@ class MetaTaskDataset(Dataset):
             return random.choice(valid_tasks)
         
         # Sample random combination from available classes
+        if len(self.available_classes) < current_way:
+            raise ValueError(f"available_classes has {len(self.available_classes)} classes, but way={current_way}")
+        
         return tuple(random.sample(self.available_classes, current_way))
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]]:
