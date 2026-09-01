@@ -39,6 +39,7 @@ class PrototypicalNetwork(MetaOptimizer):
         loss_fn: BaseLoss,
         chunk_size: int = 8,
         device: Optional[torch.device] = None,
+        backend: str = "vmap",
         **kwargs: Any,
     ):
         """
@@ -50,6 +51,7 @@ class PrototypicalNetwork(MetaOptimizer):
             loss_fn (BaseLoss): Loss module used for query set evaluation (e.g., CrossEntropy).
             chunk_size (int): Chunk size for memory management during task batch execution.
             device (Optional[torch.device]): Target hardware compute device (CPU or GPU).
+            backend (str): If you set it to "sequential", Vmap would be ignored and algorithm switches to for loop
             **kwargs: Additional operational keyword arguments.
         """
         # Initialize base MetaOptimizer class
@@ -60,6 +62,7 @@ class PrototypicalNetwork(MetaOptimizer):
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.chunk_size = chunk_size
+        self.backend = backend.lower()
 
         # Resolve target device and transfer modules
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -197,6 +200,112 @@ class PrototypicalNetwork(MetaOptimizer):
 
         return total_meta_loss, total_metric, accumulated_buffers
 
+    def _run_sequential(
+        self,
+        process_single_task: Callable,
+        Xsupport: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        Ysupport: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        Xquery: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        Yquery: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        all_buffers: Dict[str, torch.Tensor],
+        training: bool
+    ) -> Tuple[float, float, Dict[str, torch.Tensor]]:
+        """
+        Executes strictly sequential task processing for Prototypical Networks.
+
+        Instead of vectorizing tasks using `torch.func.vmap`, this dispatcher unbinds 
+        the batch and processes tasks one by one. In training mode, it triggers an immediate 
+        backward pass per task to purge the computation graph on the fly, guaranteeing 
+        a constant O(1) GPU memory footprint regardless of the batch size.
+
+        Args:
+            process_single_task (Callable): Pure closure for executing a single ProtoNet task.
+            Xsupport (Union[torch.Tensor, Dict]): Support inputs batched across tasks at dim 0.
+            Ysupport (Union[torch.Tensor, Dict]): Support targets batched across tasks at dim 0.
+            Xquery (Union[torch.Tensor, Dict]): Query inputs batched across tasks at dim 0.
+            Yquery (Union[torch.Tensor, Dict]): Query targets batched across tasks at dim 0.
+            all_buffers (Dict[str, torch.Tensor]): Master dictionary of persistent model buffers.
+            training (bool): If True, accumulates gradients via micro-backwards and clears cache.
+
+        Returns:
+            Tuple[float, float, Dict[str, torch.Tensor]]:
+                - total_meta_loss (float): True mathematical mean loss across the full batch.
+                - total_metric (float): True mathematical mean query evaluation metric.
+                - accumulated_buffers (Dict[str, torch.Tensor]): Linearly aggregated running buffers.
+        """
+        # Define helper closure to unbind batched data structures along dimension 0
+        def _unbind_batch(data: Union[torch.Tensor, Dict[str, torch.Tensor]]):
+            # Check if input container is a standard PyTorch Tensor
+            if isinstance(data, torch.Tensor):
+                # Unbind tensor along the task dimension into a tuple of slices
+                return torch.unbind(data, dim=0)
+            # Check if input is a structured dictionary of tensors
+            elif isinstance(data, dict):
+                # Unbind each tensor entry within the dictionary along dim 0
+                unbound_dict = {k: torch.unbind(v, dim=0) for k, v in data.items()}
+                # Determine total task items from the first dictionary key
+                num_items = len(next(iter(unbound_dict.values())))
+                # Reconstruct list of isolated single-task dictionaries
+                return [{k: unbound_dict[k][i] for k in unbound_dict} for i in range(num_items)]
+            # Return unsupported object unchanged
+            return data
+
+        # Unbind batched support and query structures into isolated single-task instances
+        xs_tasks = _unbind_batch(Xsupport)
+        ys_tasks = _unbind_batch(Ysupport)
+        xq_tasks = _unbind_batch(Xquery)
+        yq_tasks = _unbind_batch(Yquery)
+
+        # Extract effective batch size from the unbound tasks list
+        batch_size = len(xs_tasks)
+        # Compute individual task weighting factor for exact linear batch averaging
+        task_weight = 1.0 / batch_size
+
+        total_meta_loss = 0.0
+        total_metric = 0.0
+        accumulated_buffers = {}
+
+        # Iterate sequentially over unbound tasks
+        for i in range(batch_size):
+            # Extract current task tensors
+            x_s, y_s = xs_tasks[i], ys_tasks[i]
+            x_q, y_q = xq_tasks[i], yq_tasks[i]
+
+            # Execute single task: computes loss/metric, executes backward if training=True
+            task_loss_val, task_metric_val, task_buf = process_single_task(
+                x_s, y_s, x_q, y_q, all_buffers, task_weight=task_weight, training=training
+            )
+
+            # Accumulate reporting scalar metrics directly
+            loss_val = task_loss_val.item() if isinstance(task_loss_val, torch.Tensor) else task_loss_val
+            metric_val = task_metric_val.item() if isinstance(task_metric_val, torch.Tensor) else task_metric_val
+
+            total_meta_loss += loss_val
+            total_metric += metric_val * task_weight
+
+            # Accumulate running model buffers (BatchNorm statistics)
+            with torch.no_grad():
+                for name, buf in task_buf.items():
+                    # Handle boolean indicator masks (logical OR aggregation)
+                    if buf.dtype == torch.bool:
+                        accumulated_buffers[name] = accumulated_buffers.get(name, False) | buf
+                    # Handle standard floating point running statistics
+                    else:
+                        mean_buf = buf * task_weight
+                        if name not in accumulated_buffers:
+                            accumulated_buffers[name] = mean_buf
+                        else:
+                            accumulated_buffers[name] += mean_buf
+
+            # Aggressively release references to single-task tensors to break graph links
+            del x_s, y_s, x_q, y_q, task_buf
+
+            # Purge the CUDA allocator cache after task backward and graph deallocation
+            if training and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return total_meta_loss, total_metric, accumulated_buffers
+
     def step(
         self,
         task_itrator: Any,
@@ -234,7 +343,7 @@ class PrototypicalNetwork(MetaOptimizer):
         model_states = dict(self.model.named_parameters())
         all_buffers = dict(self.model.named_buffers())
 
-        def process_single_task(x_s, y_s, x_q, y_q, global_buffers):
+        def process_single_task(x_s, y_s, x_q, y_q, global_buffers, task_weight: float = 1.0, training: bool = True):
             """Core execution loop for a single task within vmap."""
             task_buffers = {k: v.clone() for k, v in global_buffers.items()}
             combined = {**model_states, **task_buffers}
@@ -250,6 +359,20 @@ class PrototypicalNetwork(MetaOptimizer):
                     training=True,
                     **kwargs,
                 )
+
+                if getattr(self, "backend", "vmap") == "sequential":
+                    scaled_loss = loss * task_weight
+                    scaled_loss.backward()
+                    
+                    loss_val = scaled_loss.item()
+                    metric_val = metric.item() if isinstance(metric, torch.Tensor) else metric
+                    
+                    raw_buffers = out_dict.get("buffers", task_buffers)
+                    updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
+                    
+                    del loss, scaled_loss, combined, out_dict, grads
+                    return loss_val, metric_val, updated_task_buffers
+
             else:
                 with torch.no_grad():
                     (loss, metric), out_dict = self.compute_loss(
@@ -268,27 +391,27 @@ class PrototypicalNetwork(MetaOptimizer):
 
             return loss, metric, updated_task_buffers
 
-        # Vectorize single-task processing over the task batch dimension
-        vectorized_processor = vmap(
-            process_single_task,
-            in_dims=(0, 0, 0, 0, None),
-            randomness="different",
-        )
-
-        # Reset outer optimizer gradients before accumulation
         if training:
             self.optimizer.zero_grad()
 
-        # Execute manual chunked gradient accumulation engine
-        total_meta_loss, total_metric, accumulated_buffers = self._accumulate_chunked_step(
-            vectorized_processor,
-            Xsupport,
-            Ysupport,
-            Xquery,
-            Yquery,
-            all_buffers,
-            training,
-        )
+        if getattr(self, "backend", "vmap") == "sequential":
+            total_meta_loss, total_metric, accumulated_buffers = self._run_sequential(
+                process_single_task, Xsupport, Ysupport, Xquery, Yquery, all_buffers, training
+            )
+            
+        else:
+            def _vmap_task(x_s, y_s, x_q, y_q, bufs):
+                return process_single_task(x_s, y_s, x_q, y_q, bufs, task_weight=1.0, training=training)
+
+            vectorized_processor = vmap(
+                _vmap_task,
+                in_dims=(0, 0, 0, 0, None),
+                randomness="different",
+            )
+
+            total_meta_loss, total_metric, accumulated_buffers = self._accumulate_chunked_step(
+                vectorized_processor, Xsupport, Ysupport, Xquery, Yquery, all_buffers, training
+            )
 
         # Step optimizer and update running buffers
         if training:
@@ -307,42 +430,60 @@ class PrototypicalNetwork(MetaOptimizer):
         **kwargs: Any,
     ) -> None:
         """
-        Deployment behavior for Prototypical Networks.
-        Extracts prototypes from the support set via vmap, updates running buffers, 
-        and registers aggregated prototypes in persistent deployed buffers for inference.
+        Deployment behavior for Prototypical Networks on a single machine or physical setup.
+
+        Extracts analytical prototypes directly from a single target support set, updates 
+        local running buffers, and registers the aggregated prototypes in persistent 
+        deployed buffers (`self.model.deployed_prototypes`) for standalone inference.
+        This entirely eliminates the multi-task batch dimension and `vmap` overhead.
 
         Args:
-            Xsupport (torch.Tensor): Support set inputs tensor of shape `(num_tasks, K, ...)`.
-            Ysupport (Union[torch.Tensor, Dict[str, torch.Tensor]]): Support target label structure.
-            **kwargs: Context arguments forwarded to prototype computation.
+            Xsupport (torch.Tensor): Support set inputs tensor of shape `(K, ...)`.
+            Ysupport (Union[torch.Tensor, Dict[str, torch.Tensor]]): Support target labels of shape `(K,)`.
+            **kwargs: Context arguments forwarded to prototype computation module.
         """
-        # Device transfer helper
+        # Recursive device transfer helper closure
         def to_device(obj, device):
+            # Check if object is a PyTorch Tensor
             if isinstance(obj, torch.Tensor):
+                # Transfer tensor to target compute device
                 return obj.to(device)
+            # Check if object is a dictionary container
             elif isinstance(obj, dict):
+                # Recursively migrate tensor values within the dictionary
                 return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in obj.items()}
+            # Return unsupported object unchanged
             return obj
 
+        # Transfer single support set to active hardware device
         Xsupport = to_device(Xsupport, self.device)
         Ysupport = to_device(Ysupport, self.device)
 
+        # Extract fixed parameters and initial buffers from the base model
         params = dict(self.model.named_parameters())
         all_buffers = dict(self.model.named_buffers())
 
-        def _adapt_single_task(x_s, y_s, global_buffers):
-            task_buffers = {k: v.clone() for k, v in global_buffers.items()}
-            states = {**params, **task_buffers}
-            forward_kwargs = {"training": False, "num_step": 0}
+        # Create an isolated clone of model buffers for this specific adaptation instance
+        task_buffers = {k: v.clone() for k, v in all_buffers.items()}
+        
+        # Assemble complete functional states dictionary
+        states = {**params, **task_buffers}
+        forward_kwargs = {"training": False, "num_step": 0}
 
-            # Extract representations via functional execution of backbone
-            feat_s = torch.func.functional_call(self.model.backbone, states, (x_s,), forward_kwargs)
+        # Execute prototype extraction without autograd tracking
+        with torch.no_grad():
+            self.model.eval()
+
+            # Extract representations via functional execution of the backbone network
+            feat_s = torch.func.functional_call(self.model.backbone, states, (Xsupport,), forward_kwargs)
+            # Flatten feature maps into 1D embeddings if output is multidimensional (e.g., CNNs)
             feat_s_flat = feat_s.flatten(start_dim=1) if feat_s.dim() > 2 else feat_s
 
-            labels_s = y_s["labels"] if isinstance(y_s, dict) else y_s
-            samples_mask_s = y_s.get("samples_mask", None) if isinstance(y_s, dict) else None
+            # Extract labels and optional sample masks
+            labels_s = Ysupport["labels"] if isinstance(Ysupport, dict) else Ysupport
+            samples_mask_s = Ysupport.get("samples_mask", None) if isinstance(Ysupport, dict) else None
 
-            # Compute class prototypes and capture updated center buffers
+            # Compute analytical class prototypes and capture updated center tracking buffers
             prototypes, class_mask, center_bufs = self.model.center_head.compute_class_centers(
                 features=feat_s_flat,
                 labels=labels_s,
@@ -353,44 +494,21 @@ class PrototypicalNetwork(MetaOptimizer):
                 **kwargs,
             )
 
+            # Integrate newly computed center statistics into local task buffers
             task_buffers.update(center_bufs)
             updated_task_buffers = {k: v.detach() for k, v in task_buffers.items()}
 
-            return prototypes, class_mask, updated_task_buffers
+            # Register deployed prototypes onto the base model instance for standalone deployment
+            self.model.deployed_prototypes = prototypes
+            self.model.deployed_class_mask = class_mask
 
-        # Vectorize deployment adaptation across task batch dimension
-        vectorized_adapt = vmap(
-            _adapt_single_task,
-            in_dims=(0, 0, None),
-            chunk_size=self.chunk_size,
-            randomness="different",
-        )
-
-        with torch.no_grad():
-            self.model.eval()
-            batched_prototypes, batched_masks, batched_buffers = vectorized_adapt(
-                Xsupport, Ysupport, all_buffers
-            )
-
-            # Aggregate prototypes and active class masks across tasks
-            avg_prototypes = batched_prototypes.mean(dim=0)
-            combined_class_mask = batched_masks.any(dim=0)
-
-            # Register deployed prototypes onto model for standalone deployment
-            self.model.deployed_prototypes = avg_prototypes
-            self.model.deployed_class_mask = combined_class_mask
-
-            # Synchronize running buffers respecting data types
+            # Synchronize running buffers back to the base model in-place
             for name, buffer_tensor in self.model.named_buffers():
-                if name in batched_buffers:
-                    buf = batched_buffers[name]
-                    if buf.dtype == torch.bool:
-                        buffer_tensor.copy_(buf.any(dim=0))
-                    else:
-                        buffer_tensor.copy_(buf.mean(dim=0))
+                if name in updated_task_buffers:
+                    buffer_tensor.copy_(updated_task_buffers[name])
 
-        # Clear GPU cache after parameter deployment
+        # Purge temporary CUDA allocations from allocator cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        print("✅ ProtoNet: Prototypes and running buffers securely computed and registered for deployment.")
+        print("✅ ProtoNet: Prototypes and running buffers securely computed and registered for single-task deployment.")

@@ -181,6 +181,73 @@ To evaluate the empirical speedup and scaling profile of functional task vectori
 4. **Hardware Context & Colab Constraints:**  
    > 💡 **Benchmark Hardware Note:**  
    > These benchmarks were conducted on a standard **free-tier Google Colab instance** (NVIDIA Tesla T4 GPU with ~15 GB VRAM). In this virtualized environment, physical GPU compute units and memory bandwidth are shared across multiple concurrent user sessions (typically allocating only a fraction of total hardware throughput to each runtime). On dedicated research-grade hardware (e.g., NVIDIA A100/H100 GPUs with high-bandwidth HBM3 memory), higher saturation thresholds and absolute throughput are expected.
+
+---
+## ⚙️ Execution Backends & Memory Management (`vmap` vs. `sequential`)
+
+`Parallel-MetaLearn` implements a **Dual-Backend Execution Engine** allowing seamless switching between maximum throughput parallelism and strict $O(1)$ memory-capped sequential iteration without changing the training loop API.
+
+---
+
+### 1. Dual-Backend Dispatcher (`backend="vmap"` vs `backend="sequential"`)
+
+| Feature / Metric | `backend="vmap"` (Default) | `backend="sequential"` |
+| :--- | :--- | :--- |
+| **Primary Goal** | **Maximum Training Throughput** | **Zero-OOM Scaling & Massive Models** |
+| **Execution Paradigm** | Vectorized batching via `torch.func.vmap` | Sequential task iteration via `torch.unbind` |
+| **Memory Footprint (VRAM)** | $\mathcal{O}(B_{\text{meta}} \times \text{Activations} \times (N_{\text{steps}} \text{ if 2nd-order or multi-step loss else } 1))$ | $\mathcal{O}(1 \times \text{Activations} \times (N_{\text{steps}} \text{ if 2nd-order else } 1))$ |
+| **Mathematical Accuracy** | Exact meta-batch average | Exact meta-batch average (Linear accumulation) |
+| **Multi-Step Loss (MSL)** | Full graph accumulation & batched backward | Immediate per-step backward & instant graph purge |
+| **Cache Management** | Chunked clearing (`torch.cuda.empty_cache()`) | Immediate per-task deallocation & cache flush |
+| **`chunk_size` Parameter** | **Active & Essential** (Controls sub-batch sizes) | **Ignored / Inactive** (Task-by-task $O(1)$ execution) |
+| **Recommended Use Cases** | Standard CNNs/MLPs, $B_{\text{meta}} \ge 5$, $N_{\text{steps}} \le 3$ | Large Backbones (ResNet/ViT), $B_{\text{meta}} \le 3$, $N_{\text{steps}} \ge 5$ |
+
+---
+
+### 2. When to Use Which Backend?
+
+#### 🚀 Use `backend="vmap"` When:
+* Training lightweight to medium feature extractors (e.g., 1D-CNNs, 4-Conv backbones).
+* Meta-batch size is moderate to large ($B_{\text{meta}} \ge 5$).
+* Inner adaptation steps are small ($N_{\text{steps}} \in [1, 3]$).
+* Hardware has sufficient GPU memory to exploit SM parallelism.
+* **Tuning `chunk_size`:** When running `vmap`, tune `chunk_size` to fit maximum tasks per sub-batch on your GPU.
+
+#### 🛡️ Use `backend="sequential"` When:
+* **Large Neural Architectures:** Working with memory-heavy backbones (e.g., ResNet-50, Transformers/ViTs).
+* **Deep Inner Loops:** Executing high adaptation step counts ($N_{\text{steps}} \ge 5, 10, 20$) with Second-Order derivatives without risking GPU OOM.
+* **Small Meta-Batches ($B_{\text{meta}} \le 3$):** Avoiding the initial `vmap` tracing overhead when batch sizes are minimal.
+* **Exact Mathematical Equivalency:** In `sequential` mode, gradients are mathematically accumulated as:
+  $$\nabla_{\theta} \mathcal{L}_{\text{meta}} = \frac{1}{B} \sum_{i=1}^{B} \nabla_{\theta} \mathcal{L}_{\text{task}}^{(i)}$$
+  Each task immediately executes a scaled `backward()` and destroys its forward/backward computation graphs and cached activations before processing the next task.
+
+
+
+### 3. Usage Example
+
+```python
+# 1. High-throughput Parallel Vectorization (Default)
+algorithm_fast = MAML(
+    model=model,
+    optimizer=outer_optimizer,
+    inner_optimizer=inner_optimizer,
+    support_loss_fn=loss_fn,
+    inner_steps=3,
+    backend="vmap",     # Vectorized task-level execution
+    chunk_size=8        # Active: Slices batch into chunks of 8 tasks
+)
+
+# 2. Memory-Safe Sequential Execution (For Heavy Models / Deep Steps)
+algorithm_safe = MAML(
+    model=model,
+    optimizer=outer_optimizer,
+    inner_optimizer=inner_optimizer,
+    support_loss_fn=loss_fn,
+    inner_steps=10,     # Deep adaptation without OOM
+    backend="sequential" # Sequential O(1) memory execution (chunk_size is ignored)
+)
+```
+
 ---
 
 ## Empirical Benchmark (Fault Diagnosis Domain Shift)

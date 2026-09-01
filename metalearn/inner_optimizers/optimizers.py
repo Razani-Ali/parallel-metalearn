@@ -120,7 +120,12 @@ class InnerSGDMomentum(BaseInnerOptimizer):
 
         # Unpack updated parameters and new momentum state buffer
         new_weights = pytree.tree_map(lambda x: x[0], results)
-        new_state = {"momentum_buffer": pytree.tree_map(lambda x: x[1], results)}
+        raw_state = pytree.tree_map(lambda x: x[1], results)
+        if should_detach:
+            new_state = {"momentum_buffer": pytree.tree_map(lambda buf: buf.detach(), raw_state)}
+        else:
+            new_state = {"momentum_buffer": raw_state}
+            
         return new_weights, new_state
 
 
@@ -187,7 +192,14 @@ class InnerRMSprop(BaseInnerOptimizer):
 
         # Unpack updated weights and state
         new_weights = pytree.tree_map(lambda x: x[0], results)
-        new_state = {"square_avg": pytree.tree_map(lambda x: x[1], results)}
+        raw_sq_avg = pytree.tree_map(lambda x: x[1], results)
+
+        # Detach running square averages if first-order approximation or eval mode is active
+        if should_detach:
+            new_state = {"square_avg": pytree.tree_map(lambda s: s.detach(), raw_sq_avg)}
+        else:
+            new_state = {"square_avg": raw_sq_avg}
+
         return new_weights, new_state
 
 
@@ -250,7 +262,14 @@ class InnerAdagrad(BaseInnerOptimizer):
 
         # Unpack updated parameters and new state
         new_weights = pytree.tree_map(lambda x: x[0], results)
-        new_state = {"sum_squares": pytree.tree_map(lambda x: x[1], results)}
+        raw_sum_sq = pytree.tree_map(lambda x: x[1], results)
+
+        # Detach accumulated squared gradients if first-order or non-training
+        if should_detach:
+            new_state = {"sum_squares": pytree.tree_map(lambda s: s.detach(), raw_sum_sq)}
+        else:
+            new_state = {"sum_squares": raw_sum_sq}
+
         return new_weights, new_state
 
 
@@ -327,10 +346,21 @@ class InnerAdadelta(BaseInnerOptimizer):
 
         # Unpack updated parameters and new state buffers
         new_weights = pytree.tree_map(lambda x: x[0], results)
-        new_state = {
-            "sq_avg": pytree.tree_map(lambda x: x[1], results),
-            "acc_delta": pytree.tree_map(lambda x: x[2], results)
-        }
+        raw_sq_avg = pytree.tree_map(lambda x: x[1], results)
+        raw_acc_delta = pytree.tree_map(lambda x: x[2], results)
+
+        # Detach both running square averages and accumulated deltas when appropriate
+        if should_detach:
+            new_state = {
+                "sq_avg": pytree.tree_map(lambda s: s.detach(), raw_sq_avg),
+                "acc_delta": pytree.tree_map(lambda d: d.detach(), raw_acc_delta)
+            }
+        else:
+            new_state = {
+                "sq_avg": raw_sq_avg,
+                "acc_delta": raw_acc_delta
+            }
+
         return new_weights, new_state
 
 
@@ -417,10 +447,21 @@ class InnerAdam(BaseInnerOptimizer):
 
         # Unpack updated weights and state buffers
         new_weights = pytree.tree_map(lambda x: x[0], results)
-        new_state = {
-            "exp_avg": pytree.tree_map(lambda x: x[1], results),
-            "exp_avg_sq": pytree.tree_map(lambda x: x[2], results)
-        }
+        
+        raw_exp_avg = pytree.tree_map(lambda x: x[1], results)
+        raw_exp_avg_sq = pytree.tree_map(lambda x: x[2], results)
+        
+        if should_detach:
+            new_state = {
+                "exp_avg": pytree.tree_map(lambda m: m.detach(), raw_exp_avg),
+                "exp_avg_sq": pytree.tree_map(lambda v: v.detach(), raw_exp_avg_sq)
+            }
+        else:
+            new_state = {
+                "exp_avg": raw_exp_avg,
+                "exp_avg_sq": raw_exp_avg_sq
+            }
+            
         return new_weights, new_state
 
 
@@ -504,8 +545,19 @@ class InnerAdamax(BaseInnerOptimizer):
 
         # Unpack updated parameters and new state buffers
         new_weights = pytree.tree_map(lambda x: x[0], results)
-        new_state = {
-            "exp_avg": pytree.tree_map(lambda x: x[1], results),
-            "exp_inf": pytree.tree_map(lambda x: x[2], results)
-        }
+        raw_exp_avg = pytree.tree_map(lambda x: x[1], results)
+        raw_exp_inf = pytree.tree_map(lambda x: x[2], results)
+
+        # Detach first moment and infinity norm tracking buffers
+        if should_detach:
+            new_state = {
+                "exp_avg": pytree.tree_map(lambda m: m.detach(), raw_exp_avg),
+                "exp_inf": pytree.tree_map(lambda u: u.detach(), raw_exp_inf)
+            }
+        else:
+            new_state = {
+                "exp_avg": raw_exp_avg,
+                "exp_inf": raw_exp_inf
+            }
+
         return new_weights, new_state

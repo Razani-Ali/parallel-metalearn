@@ -66,6 +66,7 @@ class MAML(MetaOptimizer):
         multi_step_loss: bool = False,
         chunk_size: int = 80,
         device: Optional[torch.device] = None,
+        backend: str = "vmap",
         **kwargs,
     ):
         """
@@ -82,6 +83,7 @@ class MAML(MetaOptimizer):
             multi_step_loss (bool): Whether to compute weighted query losses across all inner steps.
             chunk_size (int): Chunk size for vmap memory management during parallel task execution.
             device (Optional[torch.device]): Target compute device (CPU or GPU).
+            backend (str): If you set it to "sequential", Vmap would be ignored and algorithm switches to for loop
         """
         super().__init__()
         # Initialize core components
@@ -91,6 +93,7 @@ class MAML(MetaOptimizer):
         self.support_loss_fn = support_loss_fn
         self.query_loss_fn = query_loss_fn or support_loss_fn
         self.encoder = encoder
+        self.backend = backend.lower()
         
         self.num_inner_steps = inner_steps
         self.multi_step_loss = multi_step_loss
@@ -231,6 +234,106 @@ class MAML(MetaOptimizer):
 
         return total_meta_loss, total_metric, accumulated_buffers
 
+    def _run_sequential(
+        self,
+        process_single_task: Callable,
+        Xsupport: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        Ysupport: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        Xquery: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        Yquery: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        all_buffers: Dict[str, torch.Tensor],
+        training: bool
+    ) -> Tuple[float, float, Dict[str, torch.Tensor]]:
+        """
+        Executes strictly sequential task processing for meta-learning loops.
+        
+        Instead of batching all tasks into memory simultaneously via vectorized transforms (vmap),
+        this dispatcher unbinds tasks sequentially. In training mode, backward passes are executed 
+        immediately inside `process_single_task` per task to destroy intermediate forward/backward
+        computation graphs on the fly and aggressively purge the CUDA allocator cache.
+        
+        Args:
+            process_single_task (Callable): Pure task processing closure accepting single task tensors.
+            Xsupport (Union[torch.Tensor, Dict]): Support inputs batched across tasks at dim 0.
+            Ysupport (Union[torch.Tensor, Dict]): Support targets batched across tasks at dim 0.
+            Xquery (Union[torch.Tensor, Dict]): Query inputs batched across tasks at dim 0.
+            Yquery (Union[torch.Tensor, Dict]): Query targets batched across tasks at dim 0.
+            all_buffers (Dict[str, torch.Tensor]): Master dictionary of persistent model buffers.
+            training (bool): If True, triggers task-level backward accumulation and cache clearing.
+
+        Returns:
+            Tuple[float, float, Dict[str, torch.Tensor]]:
+                - total_meta_loss (float): True mathematical mean meta-loss across the entire batch.
+                - total_metric (float): True mathematical mean query evaluation metric.
+                - accumulated_buffers (Dict[str, torch.Tensor]): Linearly aggregated model running buffers.
+        """
+        # Helper closure to unbind tensors along the task dimension (dim=0)
+        def _unbind_batch(data: Union[torch.Tensor, Dict[str, torch.Tensor]]):
+            if isinstance(data, torch.Tensor):
+                # Unbind tensor along batch dimension into a tuple of single-task slices
+                return torch.unbind(data, dim=0)
+            elif isinstance(data, dict):
+                # Unbind dictionary of tensors key-by-key
+                unbound_dict = {k: torch.unbind(v, dim=0) for k, v in data.items()}
+                num_items = len(next(iter(unbound_dict.values())))
+                # Reconstruct list of task-specific dictionaries
+                return [{k: unbound_dict[k][i] for k in unbound_dict} for i in range(num_items)]
+            return data
+
+        # Unbind all batched support and query structures into task-level collections
+        xs_tasks = _unbind_batch(Xsupport)
+        ys_tasks = _unbind_batch(Ysupport)
+        xq_tasks = _unbind_batch(Xquery)
+        yq_tasks = _unbind_batch(Yquery)
+
+        # Determine batch size from the unbound elements
+        batch_size = len(xs_tasks)
+        # Weight per task to preserve the exact mathematical batch mean
+        task_weight = 1.0 / batch_size
+
+        total_meta_loss = 0.0
+        total_metric = 0.0
+        accumulated_buffers = {}
+
+        # Iterate over tasks one by one
+        for i in range(batch_size):
+            # Extract individual task tensors
+            x_s, y_s = xs_tasks[i], ys_tasks[i]
+            x_q, y_q = xq_tasks[i], yq_tasks[i]
+
+            # Execute single task: computes loss/metric, executes backward if training=True, and returns detached items
+            task_loss_val, task_metric_val, task_buf = process_single_task(
+                x_s, y_s, x_q, y_q, all_buffers, task_weight=task_weight, training=training
+            )
+
+            # Accumulate reporting scalar metrics
+            loss_val = task_loss_val.item() if isinstance(task_loss_val, torch.Tensor) else task_loss_val
+            metric_val = task_metric_val.item() if isinstance(task_metric_val, torch.Tensor) else task_metric_val
+
+            total_meta_loss += loss_val
+            total_metric += metric_val * task_weight
+
+            # Accumulate running model buffers (e.g., BatchNorm statistics)
+            with torch.no_grad():
+                for name, buf in task_buf.items():
+                    if buf.dtype == torch.bool:
+                        accumulated_buffers[name] = accumulated_buffers.get(name, False) | buf
+                    else:
+                        mean_buf = buf * task_weight
+                        if name not in accumulated_buffers:
+                            accumulated_buffers[name] = mean_buf
+                        else:
+                            accumulated_buffers[name] += mean_buf
+
+            # Aggressively release references to task-specific tensors
+            del x_s, y_s, x_q, y_q, task_buf
+
+            # Purge the CUDA cache after the task's backward pass and graph destruction
+            if training and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return total_meta_loss, total_metric, accumulated_buffers
+
     def step(self, task_itrator, training: bool = True, **kwargs) -> Tuple[float, float]:
         """
         Executes a full MAML meta-training or evaluation step safely and efficiently.
@@ -250,12 +353,12 @@ class MAML(MetaOptimizer):
 
         static_params, all_buffers, initial_fast_weights = self._extract_model_states()
 
-        def process_single_task(x_s, y_s, x_q, y_q, global_buffers):
+        def process_single_task(x_s, y_s, x_q, y_q, global_buffers, task_weight = 1.0, training = True):
             task_buffers = {k: v.clone() for k, v in global_buffers.items()}
             fast_weights = OrderedDict(initial_fast_weights)
             opt_state = self.inner_optimizer.init_state(fast_weights)
-            meta_loss = torch.tensor(0.0, device=self.device)
             is_zero_shot = (x_s.shape[0] == 0)
+            accumulated_meta_loss = 0.0 if (self.backend == "sequential" and training) else torch.tensor(0.0, device=self.device)
 
             # Label Encoding via Encoder Module
             if isinstance(y_s, dict) and "labels" in y_s and self.encoder is not None:
@@ -265,9 +368,12 @@ class MAML(MetaOptimizer):
             if not is_zero_shot:
                 for inner_step in range(self.num_inner_steps):
 
+                    should_detach = self.inner_optimizer.first_order or not training
+                    eval_weights = {k: v.detach() for k, v in fast_weights.items()} if should_detach else fast_weights
+
                     # Functional Autograd Step
                     grads, updated_task_buffers = self.inner_step_fn(
-                        fast_weights, static_params, task_buffers,
+                        eval_weights, static_params, task_buffers,
                         x_s, y_s, inner_step=inner_step, training=True, **kwargs
                     )
                     
@@ -292,6 +398,21 @@ class MAML(MetaOptimizer):
                                 loss_module=self.query_loss_fn, inner_step=inner_step,
                                 training=True, **kwargs
                             )
+
+                            if self.backend == "sequential":
+                                # Step loss weighting
+                                step_weight = self.step_weights[inner_step] if self.step_weights is not None else 1.0
+                                scaled_step_loss = (q_step_loss / step_weight) * task_weight
+                                
+                                # Accumuate gradients
+                                scaled_step_loss.backward()
+                                
+                                accumulated_meta_loss += scaled_step_loss.item()
+                                del q_step_loss, scaled_step_loss, combined, grads, updated_task_buffers
+                            else:
+                                # Graph accumulation for vmap backward
+                                accumulated_meta_loss = self._update_meta_loss(accumulated_meta_loss, q_step_loss, inner_step)
+
                         else:
                             with torch.no_grad():
                                 (q_step_loss, _), _ = self.compute_loss(
@@ -299,17 +420,16 @@ class MAML(MetaOptimizer):
                                     loss_module=self.query_loss_fn, inner_step=inner_step,
                                     training=False, **kwargs
                                 )
-                        meta_loss = self._update_meta_loss(meta_loss, q_step_loss, inner_step)
+                                accumulated_meta_loss = self._update_meta_loss(accumulated_meta_loss, q_step_loss, inner_step)
 
             # Final Step Query Evaluation
             combined = {**fast_weights, **static_params, **task_buffers}
             
-            # 🛡️ EVALUATION FIX: No graph retention during pure inference
             if training:
                 (q_step_loss, q_metric), out_dict = self.compute_loss(
                     X=x_q, Y=y_q, model_states=combined,
                     loss_module=self.query_loss_fn,
-                    inner_step=self.num_inner_steps if not is_zero_shot else 0,
+                    inner_step=self.num_inner_steps-1 if not is_zero_shot else 0,
                     training=True, **kwargs
                 )
             else:
@@ -317,28 +437,40 @@ class MAML(MetaOptimizer):
                     (q_step_loss, q_metric), out_dict = self.compute_loss(
                         X=x_q, Y=y_q, model_states=combined,
                         loss_module=self.query_loss_fn,
-                        inner_step=self.num_inner_steps if not is_zero_shot else 0,
+                        inner_step=self.num_inner_steps-1 if not is_zero_shot else 0,
                         training=False, **kwargs
                     )
             
             target_step_idx = max(0, self.num_inner_steps - 1)
-            meta_loss = self._update_meta_loss(meta_loss, q_step_loss, target_step_idx)
-            
             raw_buffers = out_dict.get("buffers", task_buffers)
             updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
-            return meta_loss, q_metric, updated_task_buffers
-
-        # Vectorize task processor (Note: no chunk_size passed to vmap, we chunk externally)
-        vectorized_processor = vmap(process_single_task, in_dims=(0, 0, 0, 0, None), randomness="different")
+            if training and self.backend == "sequential":
+                metric_val = q_metric.item() if isinstance(q_metric, torch.Tensor) else q_metric
+                step_weight = self.step_weights[target_step_idx] if (self.step_weights is not None and self.multi_step_loss) else 1.0
+                scaled_final_loss = (q_step_loss / step_weight) * task_weight
+                scaled_final_loss.backward(retain_graph=True)
+                accumulated_meta_loss += scaled_final_loss.item()
+                del q_step_loss, scaled_final_loss, combined, out_dict
+                return accumulated_meta_loss, metric_val, updated_task_buffers
+            
+            else:
+                accumulated_meta_loss = self._update_meta_loss(accumulated_meta_loss, q_step_loss, target_step_idx)
+                return accumulated_meta_loss, q_metric, updated_task_buffers
 
         if training:
             self.optimizer.zero_grad()
 
-        # Execute generic chunked accumulator
-        total_meta_loss, total_metric, accumulated_buffers = self._accumulate_chunked_step(
-            vectorized_processor, Xsupport, Ysupport, Xquery, Yquery, all_buffers, training
-        )
+        if getattr(self, "backend", "vmap") == "sequential":
+            total_meta_loss, total_metric, accumulated_buffers = self._run_sequential(
+                process_single_task, Xsupport, Ysupport, Xquery, Yquery, all_buffers, training
+            )
+
+        else:
+            vectorized_processor = vmap(process_single_task, in_dims=(0, 0, 0, 0, None), randomness="different")
+            total_meta_loss, total_metric, accumulated_buffers = self._accumulate_chunked_step(
+                vectorized_processor, Xsupport, Ysupport, Xquery, Yquery, all_buffers, training
+            )
 
         if training:
             self.optimizer.step()
@@ -371,117 +503,125 @@ class MAML(MetaOptimizer):
         **kwargs
     ) -> None:
         """
-        Adapts model parameters and running buffers on the provided support set and 
-        permanently updates `self.model` in-place.
+        Adapts the base neural network parameters and persistent running buffers on a 
+        single target task's support set and updates `self.model` directly in-place.
 
-        This method is designed exclusively for test-time task adaptation or model deployment.
-        It runs vectorized inner-loop optimization across tasks using `torch.func.vmap`,
-        aggregates the resulting adapted fast weights and updated buffers across tasks,
-        and copies them back into the base neural network.
+        This method is designed exclusively for real-world inference deployment on a single machine/task.
+        It eliminates multi-task batch dimensions and vectorized mapping overhead (`vmap`), executing 
+        stateless functional inner-loop optimization sequentially on the target support set before 
+        writing the adapted parameters and synchronized buffers permanently into the base model.
 
         Args:
-            Xsupport (torch.Tensor): Support set input feature tensor of shape `(num_tasks, K, ...)`.
-            Ysupport (Union[torch.Tensor, Dict[str, torch.Tensor]]): Support set target labels or dictionary.
-            **kwargs: Additional keyword arguments forwarded to the loss module and model forward passes.
+            Xsupport (torch.Tensor): Support set input feature tensor of shape `(K, ...)`.
+            Ysupport (Union[torch.Tensor, Dict[str, torch.Tensor]]): Support set target labels of shape `(K,)` 
+                or a target dictionary containing the `'labels'` key.
+            **kwargs: Additional keyword arguments forwarded to the loss module and forward pass operations.
         """
-        # Helper function to recursively transfer tensors or nested dictionaries to the target device
+        # Define a recursive helper closure to transfer tensors or nested dictionaries to the target device
         def to_device(obj, device):
+            # Check if the object is a standard PyTorch Tensor
             if isinstance(obj, torch.Tensor):
+                # Move tensor directly to compute device
                 return obj.to(device)
+            # Check if the object is a dictionary container
             elif isinstance(obj, dict):
+                # Recursively migrate all tensor elements within the dictionary
                 return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in obj.items()}
+            # Return unsupported object unchanged
             return obj
 
-        # Transfer input features and target labels to the designated hardware device (CPU/GPU)
+        # Transfer support features and target label structures to the active compute device (CPU or GPU)
         Xsupport = to_device(Xsupport, self.device)
         Ysupport = to_device(Ysupport, self.device)
 
-        # Extract fixed parameters, dynamic model buffers, and initial fast weights
+        # Extract fixed parameters, dynamic model buffers, and initial fast-adapting weights from the base model
         static_params, all_buffers, initial_fast_weights = self._extract_model_states()
 
-        # Define single-task adaptation closure compatible with torch.func.vmap
-        def _adapt_single_task(x_s, y_s, global_buffers):
-            # Create an isolated clone of model buffers for this specific task
-            task_buffers = {k: v.clone() for k, v in global_buffers.items()}
-            
-            # Initialize a task-specific copy of fast weights
-            fast_weights = OrderedDict(initial_fast_weights)
-            
-            # Initialize task-specific inner optimizer state (e.g., momentum buffers)
-            opt_state = self.inner_optimizer.init_state(fast_weights)
+        # Create an isolated local clone of model buffers for this specific adaptation instance
+        task_buffers = {k: v.clone() for k, v in all_buffers.items()}
 
-            # Re-index categorical labels if a label encoder is configured
-            if isinstance(y_s, dict) and "labels" in y_s and self.encoder is not None:
-                # In single-set adaptation (support only), encode labels using support set itself
-                y_s_enc, _ = self.encoder(y_s["labels"], y_s["labels"])
-                y_s = {**y_s, "labels": y_s_enc}
+        # Instantiate a dedicated OrderedDict copy of initial fast weights to track gradient updates
+        fast_weights = OrderedDict(initial_fast_weights)
 
-            # Check if support set contains valid samples (skips adaptation for zero-shot)
-            is_zero_shot = (x_s.shape[0] == 0)
+        # Initialize the stateless inner optimizer state (e.g., zero momentum buffers) for these weights
+        opt_state = self.inner_optimizer.init_state(fast_weights)
 
-            if not is_zero_shot:
-                # Execute inner adaptation gradient steps
-                for inner_step in range(self.num_inner_steps):
-                    # Check if first-order approximation is enabled in the inner optimizer
+        # Re-index categorical labels if a label encoder is registered on the meta-optimizer instance
+        if isinstance(Ysupport, dict) and "labels" in Ysupport and getattr(self, "encoder", None) is not None:
+            # Map raw labels into 0-indexed categorical space using the support set as its own reference
+            y_s_enc, _ = self.encoder(Ysupport["labels"], Ysupport["labels"])
+            # Reconstruct dictionary with transformed categorical labels
+            Ysupport = {**Ysupport, "labels": y_s_enc}
 
-                    # Compute support gradients and capture updated buffers using functional autograd
-                    grads, updated_task_buffers = self.inner_step_fn(
-                        fast_weights, static_params, task_buffers,
-                        x_s, y_s, inner_step=inner_step, training=True, **kwargs
-                    )
+        # Check whether the support set is empty to safely support zero-shot evaluation without gradient steps
+        is_zero_shot = (Xsupport.shape[0] == 0)
 
-                    # Update persistent task buffers for subsequent inner adaptation steps
-                    task_buffers = {k: v.detach() for k, v in updated_task_buffers.items()}
+        # Execute inner-loop gradient adaptation steps if support samples are present
+        if not is_zero_shot:
+            # Iterate through the configured number of inner gradient descent steps
+            for inner_step in range(self.num_inner_steps):
+                # Detach fast weights to truncate the autograd history graph and prevent activation memory accumulation
+                eval_weights = {k: v.detach() for k, v in fast_weights.items()}
 
-                    # Apply inner optimizer update rule to compute adapted fast weights
-                    fast_weights, opt_state = self.inner_optimizer(
-                        fast_weights=fast_weights,
-                        gradients=grads, state=opt_state,
-                        training=False, step=inner_step
-                    )
-
-            # Combine adapted fast weights with static parameters and updated task buffers
-            combined = {**fast_weights, **static_params, **task_buffers}
-            
-            # Execute final functional forward pass to capture finalized model buffers
-            with torch.no_grad():
-                _, out_dict = self.compute_loss(
-                    X=x_s, Y=y_s, model_states=combined,
-                    loss_module=self.support_loss_fn,
-                    inner_step=self.num_inner_steps if not is_zero_shot else 0,
-                    training=False, **kwargs
+                # Compute support loss gradients and capture updated dynamic buffers using functional autograd
+                grads, updated_task_buffers = self.inner_step_fn(
+                    eval_weights, static_params, task_buffers,
+                    Xsupport, Ysupport, inner_step=inner_step, training=True, **kwargs
                 )
 
-            # Extract finalized buffers from output dictionary, falling back to task_buffers if empty
-            raw_buffers = out_dict.get("buffers", task_buffers)
-            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
+                # Detach and update local task buffers for subsequent inner adaptation steps
+                task_buffers = {k: v.detach() for k, v in updated_task_buffers.items()}
 
-            # Return adapted task parameters and final running buffers
-            return fast_weights, updated_task_buffers
+                # Apply the functional inner optimizer update rule to compute adapted fast weights for this step
+                fast_weights, opt_state = self.inner_optimizer(
+                    fast_weights=fast_weights,
+                    gradients=grads, 
+                    state=opt_state,
+                    training=False, 
+                    step=inner_step
+                )
 
-        # Vectorize single-task adaptation across the task batch dimension
-        vectorized_adapt = vmap(
-            _adapt_single_task, 
-            in_dims=(0, 0, None), 
-            chunk_size=self.chunk_size, 
-            randomness="different"
-        )
-        
-        # Execute vectorized task adaptation across all support tasks simultaneously
-        fast_weights_batched, batched_buffers = vectorized_adapt(Xsupport, Ysupport, all_buffers)
+                # Delete temporary gradient references to free memory immediately
+                del grads, updated_task_buffers, eval_weights
 
-        # Permanently copy adapted parameters and task-averaged buffers back to the base model
+        # Assemble the final model state by combining adapted fast weights, frozen parameters, and task buffers
+        combined = {**fast_weights, **static_params, **task_buffers}
+
+        # Execute a final stateless forward pass to capture finalized model buffers (e.g., running stats)
         with torch.no_grad():
-            # Update trainable model parameters with mean adapted values across tasks
-            for name, param in self.model.named_parameters():
-                if name in fast_weights_batched:
-                    param.copy_(fast_weights_batched[name].mean(dim=0))
-            
-            # Update persistent model buffers with mean updated values across tasks
-            for name, buffer_tensor in self.model.named_buffers():
-                if name in batched_buffers:
-                    buffer_tensor.copy_(batched_buffers[name].mean(dim=0))
+            # Run functional forward pass without tracking autograd computation graphs
+            _, out_dict = self.compute_loss(
+                X=Xsupport, 
+                Y=Ysupport, 
+                model_states=combined,
+                loss_module=self.support_loss_fn,
+                inner_step=self.num_inner_steps if not is_zero_shot else 0,
+                training=False, 
+                **kwargs
+            )
 
-        # Clear GPU cache after parameter deployment
+        # Extract finalized running buffers from the forward pass output, falling back to local task buffers
+        raw_buffers = out_dict.get("buffers", task_buffers)
+        # Detach all finalized buffer tensors from any potential computation context
+        updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
+
+        # Permanently copy the adapted fast weights and updated buffers back into the base model instance in-place
+        with torch.no_grad():
+            # Iterate over named parameters and copy corresponding adapted weights directly
+            for name, param in self.model.named_parameters():
+                # Check if this parameter was designated as an adapting fast weight
+                if name in fast_weights:
+                    # In-place parameter copy
+                    param.copy_(fast_weights[name])
+
+            # Iterate over named persistent buffers and copy corresponding updated values directly
+            for name, buffer_tensor in self.model.named_buffers():
+                # Check if this buffer exists in the finalized updated buffers dictionary
+                if name in updated_task_buffers:
+                    # In-place buffer copy
+                    buffer_tensor.copy_(updated_task_buffers[name])
+
+        # Purge temporary CUDA allocations from the allocator cache to maintain a minimal VRAM footprint
         if torch.cuda.is_available():
+            # Free unused cached GPU memory
             torch.cuda.empty_cache()

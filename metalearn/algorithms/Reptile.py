@@ -46,6 +46,7 @@ class Reptile(MetaOptimizer):
         inner_steps: int = 5,
         chunk_size: int = 8,
         device: Optional[torch.device] = None,
+        backend: str = "vmap",
         **kwargs: Any,
     ):
         """
@@ -61,6 +62,7 @@ class Reptile(MetaOptimizer):
             inner_steps (int): Total number of inner gradient steps applied on the support set.
             chunk_size (int): Sub-batch size processed concurrently to cap VRAM consumption.
             device (Optional[torch.device]): Target hardware compute device (CPU or GPU).
+            backend (str): If you set it to "sequential", Vmap would be ignored and algorithm switches to for loop
             **kwargs: Additional operational parameters.
         """
         # Initialize base MetaOptimizer class
@@ -78,6 +80,7 @@ class Reptile(MetaOptimizer):
         self.num_inner_steps = inner_steps
         self.chunk_size = chunk_size
         self.encoder = encoder
+        self.backend = backend.lower()
 
         # Resolve target compute device and transfer all modules
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -275,6 +278,113 @@ class Reptile(MetaOptimizer):
 
         return accumulated_deltas, total_query_loss, total_metric, accumulated_buffers
 
+    def _run_sequential(
+        self,
+        process_single_task: Callable,
+        Xsupport: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        Ysupport: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        Xquery: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        Yquery: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        all_buffers: Dict[str, torch.Tensor],
+        training: bool
+    ) -> Tuple[Dict[str, torch.Tensor], float, float, Dict[str, torch.Tensor]]:
+        """
+        Executes strictly sequential task processing for the Reptile algorithm.
+
+        Instead of vectorizing all tasks across memory simultaneously via `torch.func.vmap`,
+        this dispatcher unbinds tasks sequentially. It computes the parameter deltas 
+        (W_adapted - W_initial) per task and accumulates them. Because Reptile relies on 
+        weight differences rather than outer-loop query gradients, this completely prevents 
+        GPU OOM failures by aggressively freeing the CUDA cache after each task.
+
+        Args:
+            process_single_task (Callable): Pure single-task execution closure.
+            Xsupport (Union[torch.Tensor, Dict]): Support inputs batched across tasks at dim 0.
+            Ysupport (Union[torch.Tensor, Dict]): Support targets batched across tasks at dim 0.
+            Xquery (Union[torch.Tensor, Dict]): Query inputs batched across tasks at dim 0.
+            Yquery (Union[torch.Tensor, Dict]): Query targets batched across tasks at dim 0.
+            all_buffers (Dict[str, torch.Tensor]): Master dictionary of persistent model buffers.
+            training (bool): Operational training flag.
+
+        Returns:
+            Tuple[Dict[str, torch.Tensor], float, float, Dict[str, torch.Tensor]]:
+                - accumulated_deltas (Dict): Weighted parameter deltas for the outer update.
+                - total_query_loss (float): Mean query loss across all tasks (for logging).
+                - total_metric (float): Mean query performance metric across all tasks.
+                - accumulated_buffers (Dict): Weighted running buffers dictionary.
+        """
+        # Helper closure to unbind batched data structures along dimension 0
+        def _unbind_batch(data: Union[torch.Tensor, Dict[str, torch.Tensor]]):
+            if isinstance(data, torch.Tensor):
+                return torch.unbind(data, dim=0)
+            elif isinstance(data, dict):
+                unbound_dict = {k: torch.unbind(v, dim=0) for k, v in data.items()}
+                num_items = len(next(iter(unbound_dict.values())))
+                return [{k: unbound_dict[k][i] for k in unbound_dict} for i in range(num_items)]
+            return data
+
+        # Unbind batched support and query structures into isolated single-task instances
+        xs_tasks = _unbind_batch(Xsupport)
+        ys_tasks = _unbind_batch(Ysupport)
+        xq_tasks = _unbind_batch(Xquery)
+        yq_tasks = _unbind_batch(Yquery)
+
+        batch_size = len(xs_tasks)
+        task_weight = 1.0 / batch_size
+
+        total_query_loss = 0.0
+        total_metric = 0.0
+        accumulated_deltas: Dict[str, torch.Tensor] = {}
+        accumulated_buffers: Dict[str, torch.Tensor] = {}
+
+        # Iterate sequentially over unbound tasks
+        for i in range(batch_size):
+            x_s, y_s = xs_tasks[i], ys_tasks[i]
+            x_q, y_q = xq_tasks[i], yq_tasks[i]
+
+            # Execute single task and extract deltas, loss, metric, and buffers
+            task_deltas, task_loss_val, task_metric_val, task_buf = process_single_task(
+                x_s, y_s, x_q, y_q, all_buffers, task_weight=task_weight, training=training
+            )
+
+            # Accumulate reporting scalar metrics
+            loss_val = task_loss_val.item() if isinstance(task_loss_val, torch.Tensor) else task_loss_val
+            metric_val = task_metric_val.item() if isinstance(task_metric_val, torch.Tensor) else task_metric_val
+
+            total_meta_loss += loss_val
+            total_metric += metric_val * task_weight
+
+            # Accumulate weight deltas and running buffers
+            with torch.no_grad():
+                # Accumulate pseudo-gradients (deltas)
+                if training:
+                    for name, delta_tensor in task_deltas.items():
+                        weighted_delta = delta_tensor * task_weight
+                        if name not in accumulated_deltas:
+                            accumulated_deltas[name] = weighted_delta
+                        else:
+                            accumulated_deltas[name] += weighted_delta
+
+                # Accumulate running stats (e.g., BatchNorm)
+                for name, buf in task_buf.items():
+                    if buf.dtype == torch.bool:
+                        accumulated_buffers[name] = accumulated_buffers.get(name, False) | buf
+                    else:
+                        mean_buf = buf * task_weight
+                        if name not in accumulated_buffers:
+                            accumulated_buffers[name] = mean_buf
+                        else:
+                            accumulated_buffers[name] += mean_buf
+
+            # Aggressively release references to single-task tensors to break graph links
+            del x_s, y_s, x_q, y_q, task_deltas, task_buf
+
+            # Purge the CUDA allocator cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return accumulated_deltas, total_query_loss, total_metric, accumulated_buffers
+
     def step(
         self,
         task_itrator: Any,
@@ -303,8 +413,7 @@ class Reptile(MetaOptimizer):
 
         static_params, all_buffers, initial_fast_weights = self._extract_model_states()
 
-        def process_single_task(x_s, y_s, x_q, y_q, global_buffers):
-            """Core execution loop for a single task within vmap."""
+        def process_single_task(x_s, y_s, x_q, y_q, global_buffers, task_weight: float = 1.0, training: bool = True):
             task_buffers = {k: v.clone() for k, v in global_buffers.items()}
             fast_weights = OrderedDict(initial_fast_weights)
             opt_state = self.inner_optimizer.init_state(fast_weights)
@@ -319,10 +428,13 @@ class Reptile(MetaOptimizer):
             if not is_zero_shot:
                 # 1. Execute inner adaptation steps towards task manifold
                 for inner_step in range(self.num_inner_steps):
+                    # 🛠️ GHOST GRAPH FIX: Detach weights early for First-Order MAML
+                    should_detach = self.inner_optimizer.first_order or not training
+                    eval_weights = {k: v.detach() for k, v in fast_weights.items()} if should_detach else fast_weights
 
                     # Compute support gradients using First-Order autograd
                     grads, updated_task_buffers = self.inner_step_fn(
-                        fast_weights,
+                        eval_weights,
                         static_params,
                         task_buffers,
                         x_s,
@@ -344,6 +456,8 @@ class Reptile(MetaOptimizer):
                         training=False
                     )
 
+                    del grads, updated_task_buffers
+
             # 2. Compute Reptile Deltas: (W_adapted - W_initial)
             param_deltas = pytree.tree_map(lambda w_new, w_old: w_new - w_old, fast_weights, initial_fast_weights)
 
@@ -363,29 +477,33 @@ class Reptile(MetaOptimizer):
             raw_buffers = out_dict.get("buffers", task_buffers)
             updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
-            return param_deltas, q_loss, q_metric, updated_task_buffers
+            if self.backend == "sequential":
+                loss_val = q_loss.item() if isinstance(q_loss, torch.Tensor) else q_loss
+                metric_val = q_metric.item() if isinstance(q_metric, torch.Tensor) else q_metric
+                return param_deltas, loss_val, metric_val, updated_task_buffers
+            else:
+                return param_deltas, q_loss, q_metric, updated_task_buffers
 
-        # Vectorize single-task processing across the task batch dimension
-        vectorized_processor = vmap(
-            process_single_task,
-            in_dims=(0, 0, 0, 0, None),
-            randomness="different",
-        )
-
-        # Reset outer optimizer gradients before accumulation
         if training:
             self.optimizer.zero_grad()
 
-        # Execute manual chunked accumulation engine
-        vectorized_deltas, query_loss, query_metric, accumulated_buffers = self._accumulate_chunked_step(
-            vectorized_processor,
-            Xsupport,
-            Ysupport,
-            Xquery,
-            Yquery,
-            all_buffers,
-            training,
-        )
+        if getattr(self, "backend", "vmap") == "sequential":
+            vectorized_deltas, query_loss, query_metric, accumulated_buffers = self._run_sequential(
+                process_single_task, Xsupport, Ysupport, Xquery, Yquery, all_buffers, training
+            )
+        else:
+            def _vmap_task(x_s, y_s, x_q, y_q, bufs):
+                return process_single_task(x_s, y_s, x_q, y_q, bufs, task_weight=1.0, training=training)
+
+            vectorized_processor = vmap(
+                _vmap_task,
+                in_dims=(0, 0, 0, 0, None),
+                randomness="different",
+            )
+
+            vectorized_deltas, query_loss, query_metric, accumulated_buffers = self._accumulate_chunked_step(
+                vectorized_processor, Xsupport, Ysupport, Xquery, Yquery, all_buffers, training
+            )
 
         # Outer loop meta-optimization step (First-Order Pseudo-Gradient Injection)
         if training:
@@ -413,12 +531,16 @@ class Reptile(MetaOptimizer):
         **kwargs: Any,
     ) -> None:
         """
-        Adapts parameters and buffers on the provided support set and permanently updates `self.model`.
-        Intended exclusively for test-time adaptation or deployment in Reptile.
+        Adapts parameters and buffers on a single target task's support set and permanently 
+        updates `self.model` in-place. Intended exclusively for real-world deployment.
+
+        This method eliminates the multi-task batch dimension overhead (`vmap`). It directly 
+        executes functional inner-loop optimization sequentially on the target support set 
+        before writing the adapted weights and synchronized buffers back to the base model.
 
         Args:
-            Xsupport (torch.Tensor): Support set inputs tensor of shape `(num_tasks, K, ...)`.
-            Ysupport (Union[torch.Tensor, Dict[str, torch.Tensor]]): Support target label structure.
+            Xsupport (torch.Tensor): Support set inputs tensor of shape `(K, ...)`.
+            Ysupport (Union[torch.Tensor, Dict[str, torch.Tensor]]): Support target label structure of shape `(K,)`.
             **kwargs: Operational arguments passed down to loss modules and model forward pass.
         """
         # Device migration helper
@@ -436,86 +558,73 @@ class Reptile(MetaOptimizer):
         # Extract current model state split
         static_params, all_buffers, initial_fast_weights = self._extract_model_states()
 
-        # Single-task adaptation closure compatible with torch.func.vmap
-        def _adapt_single_task(x_s, y_s, global_buffers):
-            task_buffers = {k: v.clone() for k, v in global_buffers.items()}
-            fast_weights = OrderedDict(initial_fast_weights)
-            opt_state = self.inner_optimizer.init_state(fast_weights)
+        # Create isolated local clone of model buffers
+        task_buffers = {k: v.clone() for k, v in all_buffers.items()}
+        fast_weights = OrderedDict(initial_fast_weights)
+        opt_state = self.inner_optimizer.init_state(fast_weights)
 
-            # Re-index labels if encoder is present
-            if isinstance(y_s, dict) and "labels" in y_s and self.encoder is not None:
-                y_s_enc, _ = self.encoder(y_s["labels"], y_s["labels"])
-                y_s = {**y_s, "labels": y_s_enc}
+        # Re-index labels if encoder is present
+        if isinstance(Ysupport, dict) and "labels" in Ysupport and self.encoder is not None:
+            y_s_enc, _ = self.encoder(Ysupport["labels"], Ysupport["labels"])
+            Ysupport = {**Ysupport, "labels": y_s_enc}
 
-            is_zero_shot = x_s.shape[0] == 0
+        is_zero_shot = Xsupport.shape[0] == 0
 
-            if not is_zero_shot:
-                # Execute inner adaptation steps towards task manifold
-                for inner_step in range(self.num_inner_steps):
+        if not is_zero_shot:
+            # Execute inner adaptation steps towards task manifold
+            for inner_step in range(self.num_inner_steps):
+                # Detach weights to prevent massive activation memory build-up in deployment
+                eval_weights = {k: v.detach() for k, v in fast_weights.items()}
 
-                    grads, updated_task_buffers = self.inner_step_fn(
-                        fast_weights,
-                        static_params,
-                        task_buffers,
-                        x_s,
-                        y_s,
-                        inner_step=inner_step,
-                        training=True,
-                        **kwargs,
-                    )
-
-                    task_buffers = {k: v.detach() for k, v in updated_task_buffers.items()}
-
-                    fast_weights, opt_state = self.inner_optimizer(
-                        fast_weights=fast_weights,
-                        gradients=grads,
-                        state=opt_state,
-                        step=inner_step,
-                        training=False
-                    )
-
-            # Capture finalized buffers
-            combined = {**fast_weights, **static_params, **task_buffers}
-            with torch.no_grad():
-                _, out_dict = self.compute_loss(
-                    X=x_s,
-                    Y=y_s,
-                    model_states=combined,
-                    loss_module=self.support_loss_fn,
-                    inner_step=self.num_inner_steps,
-                    training=False,
+                grads, updated_task_buffers = self.inner_step_fn(
+                    eval_weights,
+                    static_params,
+                    task_buffers,
+                    Xsupport,
+                    Ysupport,
+                    inner_step=inner_step,
+                    training=True,
                     **kwargs,
                 )
 
-            raw_buffers = out_dict.get("buffers", task_buffers)
-            updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
+                task_buffers = {k: v.detach() for k, v in updated_task_buffers.items()}
 
-            return fast_weights, updated_task_buffers
+                fast_weights, opt_state = self.inner_optimizer(
+                    fast_weights=fast_weights,
+                    gradients=grads,
+                    state=opt_state,
+                    step=inner_step,
+                    training=False
+                )
 
-        # Vectorize single-task adaptation across the batch dimension
-        vectorized_adapt = vmap(
-            _adapt_single_task,
-            in_dims=(0, 0, None),
-            chunk_size=self.chunk_size,
-            randomness="different",
-        )
+                # Delete temporary gradient references
+                del grads, updated_task_buffers, eval_weights
 
-        # Execute parallel adaptation across all support tasks
-        fast_weights_batched, batched_buffers = vectorized_adapt(Xsupport, Ysupport, all_buffers)
+        # Capture finalized buffers via stateless forward pass
+        combined = {**fast_weights, **static_params, **task_buffers}
+        with torch.no_grad():
+            _, out_dict = self.compute_loss(
+                X=Xsupport,
+                Y=Ysupport,
+                model_states=combined,
+                loss_module=self.support_loss_fn,
+                inner_step=self.num_inner_steps if not is_zero_shot else 0,
+                training=False,
+                **kwargs,
+            )
+
+        raw_buffers = out_dict.get("buffers", task_buffers)
+        updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
 
         # Permanently copy adapted parameters and task-averaged buffers back to base model
         with torch.no_grad():
             for name, param in self.model.named_parameters():
-                if name in fast_weights_batched:
-                    param.copy_(fast_weights_batched[name].mean(dim=0))
+                if name in fast_weights:
+                    param.copy_(fast_weights[name])
 
             for name, buffer_tensor in self.model.named_buffers():
-                if name in batched_buffers:
-                    buf = batched_buffers[name]
-                    if buf.dtype == torch.bool:
-                        buffer_tensor.copy_(buf.any(dim=0))
-                    else:
-                        buffer_tensor.copy_(buf.mean(dim=0))
+                if name in updated_task_buffers:
+                    buffer_tensor.copy_(updated_task_buffers[name])
 
         # Clear GPU allocation cache
         if torch.cuda.is_available():
