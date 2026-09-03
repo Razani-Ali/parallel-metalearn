@@ -4,3 +4,4 @@ from .ProtoMAML import ProtoMAML
 from .ProtoMAML2 import ProtoMAMLv2
 from .PrototypicalNet import PrototypicalNetwork
 from .Reptile import Reptile
+from .TAGML import TAGML

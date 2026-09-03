@@ -370,7 +370,7 @@ class PrototypicalNetwork(MetaOptimizer):
                     raw_buffers = out_dict.get("buffers", task_buffers)
                     updated_task_buffers = {k: v.detach() for k, v in raw_buffers.items()}
                     
-                    del loss, scaled_loss, combined, out_dict, grads
+                    del loss, scaled_loss, combined, out_dict
                     return loss_val, metric_val, updated_task_buffers
 
             else:

@@ -61,17 +61,22 @@ pip install -e .
 
 ## Supported Algorithms
 
-| Algorithm | Paradigm | Derivative Order | Key Reference |
-| --- | --- | --- | --- |
-| **MAML** | Gradient-based | 1st & 2nd Order | Finn et al. (2017) |
-| **FOMAML** | Gradient-based | 1st Order | Finn et al. (2017) |
-| **ANIL** | Representation-based | 1st & 2nd Order | Raghu et al. (2019) |
-| **BOIL** | Body-Only Inner Loop | 1st & 2nd Order | Oh et al. (2020) |
-| **Meta-SGD** | Learnable Step Sizes | 1st & 2nd Order | Li et al. (2017) |
-| **MAML++** | Multi-Step Loss & MSL | 1st & 2nd Order | Antoniou et al. (2019) |
-| **ProtoMAML (v1 & v2)** | Metric + Gradient Hybrid | 1st & 2nd Order | Triantafillou et al. (2019) |
-| **Prototypical Networks** | Metric-based | Non-parametric | Snell et al. (2017) |
-| **Reptile** | First-order Directional | 1st Order | Nichol et al. (2018) |
+| Algorithm | Paradigm | Derivative Order | Domain Motivation & Origin | Key Reference |
+| --- | --- | --- | --- | --- |
+| **MAML** | Gradient-based | 1st & 2nd Order | General Meta-Learning | Finn et al. (2017) |
+| **FOMAML** | Gradient-based | 1st Order | General Meta-Learning | Finn et al. (2017) |
+| **ANIL** | Representation-based | 1st & 2nd Order | General Meta-Learning | Raghu et al. (2019) |
+| **BOIL** | Body-Only Inner Loop | 1st & 2nd Order | General Meta-Learning | Oh et al. (2020) |
+| **Meta-SGD** | Learnable Step Sizes | 1st & 2nd Order | General Meta-Learning | Li et al. (2017) |
+| **MAML++** | Multi-Step Loss & MSL | 1st & 2nd Order | General Meta-Learning | Antoniou et al. (2019) |
+| **ProtoMAML (v1 & v2)** | Metric + Gradient Hybrid | 1st & 2nd Order | General Few-Shot Learning | Triantafillou et al. (2019) |
+| **Prototypical Networks** | Metric-based | Non-parametric | General Metric Learning | Snell et al. (2017) |
+| **Reptile** | First-order Directional | 1st Order | General Meta-Learning | Nichol et al. (2018) |
+| **TAGML** | Task-Unbiased Gradient-based | 1st & 2nd Order | Mechanical Signal Diagnosis | Yang et al. (2023) |
+| **PTFM** | Time-Frequency Metric-based | Non-parametric | Rotational Machinery Dynamics | Wang et al. (2025) |
+
+> **Note on Cross-Domain Generality:**  
+> While **TAGML** and **PTFM** were originally introduced and evaluated in the mechanical engineering literature (specifically for vibration-based few-shot fault diagnosis in bearing and transmission systems), their algorithmic formulations are implemented in a strictly domain-agnostic manner within this framework. Specifically, the Task-Agnostic Regularization (entropy-reduction penalty) of TAGML and the dual-branch Time-Frequency mixing mechanism of PTFM are decoupled from specific sensor physical setups, allowing them to serve as generic meta-optimizers and backbone pipelines for arbitrary sequence and multi-modal few-shot tasks.
 
 ---
 
