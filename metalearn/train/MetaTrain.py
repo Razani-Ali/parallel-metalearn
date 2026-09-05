@@ -149,6 +149,7 @@ class MetaTrain:
         """
         # --- 1. Setup & Directory Initialization ---
         erl_stp_tresh = kwargs.get("erl_stp_tresh", 1e-4)
+        display_interval = kwargs.get("display_interval", 1)
         
         # Set temporary working directory
         temp_path = temp_path or tempfile.gettempdir()
@@ -186,18 +187,43 @@ class MetaTrain:
             no_improve_count = ckpt['no_improve_count']
             start_epoch = ckpt['last_epoch'] + 1
 
+            load_msg = (
+                f"\n{'=' * 60}\n"
+                f"📥 Checkpoint successfully loaded from: {chkpt_path}\n"
+                f"   • Resuming from Epoch : {start_epoch + 1}/{epochs}\n"
+                f"   • Best Val Metric     : {best_val_metric * 100:.2f}%\n"
+                f"   • Best Val Loss       : {best_val_loss:.4f} (at Epoch {best_epoch + 1})\n"
+                f"{'=' * 60}\n"
+            )
+            print(load_msg)
+            self.logger.info(load_msg)
+
         # Check early stopping limit upon resume
         if patience and no_improve_count >= patience:
             start_epoch = epochs
 
+        if start_epoch >= epochs:
+            skip_msg = f"⚠️ Training already completed ({start_epoch}/{epochs} epochs finished). Skipping meta-training loop."
+            print(skip_msg)
+            self.logger.info(skip_msg)
+
+            if best_model_state and kwargs.get('load_best_model', True):
+                self.model.load_state_dict(best_model_state)
+                print(f"Loaded best model from epoch {best_epoch + 1} (Val Metric: {best_val_metric:.4f})")
+
+            self._close_local_logger()
+            return history, best_val_metric, best_val_loss
+
         # Progress Bar
         last_val_loss_str = "N/A"
         last_val_acc_str = "N/A"
-        pbar = tqdm(range(start_epoch, epochs), leave=True, desc="🚀 Meta-Training", dynamic_ncols=True)
+        pbar = tqdm(total=epochs, initial=start_epoch, leave=True, desc="🚀 Meta-Training", dynamic_ncols=True)
 
         self.logger.info(f"{'+'*20} Starting Meta-Training Process... {'+'*20}\n")
 
-        for epoch in pbar:
+        for epoch in range(start_epoch, epochs):
+            needs_display = ((epoch + 1) % display_interval == 0) or (epoch == 0) or (epoch == epochs - 1)
+
             # Record start time of pure training step
             t_start = time.time()
 
@@ -222,7 +248,8 @@ class MetaTrain:
                 val_trials = kwargs.get('val_trials', 50)
                 val_loss, val_metric = self.meta_test(
                     Loader=self.ValIterator, 
-                    trials=val_trials, 
+                    trials=val_trials,
+                    use_tqdm=needs_display,
                     **kwargs
                 )
 
@@ -251,14 +278,17 @@ class MetaTrain:
             )
 
             # Update progress bar display
-            pbar.set_postfix({
-                'Tr-Loss': f"{train_loss:.4f}",
-                'Tr-Acc': f"{train_metric * 100:.1f}%",
-                'Val-Loss': last_val_loss_str,
-                'Val-Acc': last_val_acc_str,
-                "Best Vall-Acc": f"{best_val_metric * 100:.1f}%",
-                "Best Epoch": best_epoch,
-            })
+            if needs_display:
+                pbar.set_postfix({
+                    'Tr-Loss': f"{train_loss:.4f}",
+                    'Tr-Acc': f"{train_metric * 100:.1f}%",
+                    'Val-Loss': last_val_loss_str,
+                    'Val-Acc': last_val_acc_str,
+                    "Best Vall-Acc": f"{best_val_metric * 100:.1f}%",
+                    "Best Epoch": best_epoch,
+                })
+
+                pbar.update((epoch + 1) - pbar.n)
 
             # --- 4. Model Selection & Early Stopping ---
             if needs_checkpoint and self.ValIterator:
@@ -303,8 +333,8 @@ class MetaTrain:
                     'last_epoch': epoch
                 })
                 # Safely copy files to permanent log folder
-                safe_copy(tmp_chkpt_path, chkpt_path)
-                safe_copy(os.path.join(temp_path, 'log.txt'), log_path)
+                safe_copy(tmp_chkpt_path, chkpt_path, show_progress=needs_display)
+                safe_copy(os.path.join(temp_path, 'log.txt'), log_path, show_progress=needs_display)
 
             # Clean GPU cache after each epoch
             if torch.cuda.is_available():
@@ -323,6 +353,7 @@ class MetaTrain:
         self,
         Loader: Any,
         trials: int = 10,
+        use_tqdm: bool = False,
         **kwargs: Any
     ) -> Tuple[float, float]:
         """
@@ -338,11 +369,12 @@ class MetaTrain:
         """
 
         total_loss, total_metric = 0.0, 0.0
-        test_iter = iter(Loader)
 
-        pbar = tqdm(range(trials), desc="🧪 Meta-Testing", leave=False, dynamic_ncols=True)
+        task_iterable = range(trials)
+        if use_tqdm:
+            task_iterable = tqdm(task_iterable, desc="🧪 Meta-Testing", leave=False, dynamic_ncols=True)
 
-        for step_idx in pbar:
+        for step_idx in task_iterable:
             # Run non-training evaluation step
             loss, metric = self.algorithm.step(Loader, training=False, **kwargs)
 
@@ -355,33 +387,16 @@ class MetaTrain:
             running_loss = total_loss / (step_idx + 1)
             running_metric = total_metric / (step_idx + 1)
 
-            pbar.set_postfix({
-                'Avg-Loss': f"{running_loss:.4f}", 
-                'Avg-Acc': f"{running_metric * 100:.2f}%"
-            })
+            if use_tqdm:
+                task_iterable.set_postfix({
+                    'Avg-Loss': f"{running_loss:.4f}", 
+                    'Avg-Acc': f"{running_metric * 100:.2f}%"
+                })
 
-        pbar.close()
+        if use_tqdm:
+            task_iterable.close()
 
         return total_loss / trials, total_metric / trials
-
-    def adapt2task(self, Loader: Any, **kwargs: Any) -> None:
-        """
-        Extracts ش task from Loader and adapts model parameters directly 
-        using the algorithm's deployment method (`adapt_and_update`).
-
-        Args:
-            Loader (Any): Task loader containing support set samples.
-            **kwargs: Additional context parameters for adaptation.
-        """
-        # Fetch initial batch (Support Set)
-        Xs, Ys, _, _ = next(iter(Loader))
-        
-        # Permanently adapt the base neural network
-        self.algorithm.adapt_and_update(
-            Xsupport=Xs.to(self.algorithm.device),
-            Ysupport=Ys.to(self.algorithm.device),
-            **kwargs
-        )
 
     def _close_local_logger(self) -> None:
         """Flushes and releases all active logging handlers to prevent resource leaks."""

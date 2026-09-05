@@ -197,7 +197,7 @@ def _parallel_dir_copy_engine(src_path: Path, dst_path: Path, max_workers: int, 
 
 
 def safe_copy(src, dst, max_retries=7, chunk_size=128*1024*1024,
-              force_sync=False, max_workers=8):
+              force_sync=False, max_workers=8, show_progress=False):
     """
     A simplified single-responsibility core transfer engine.
     Handles thread-safe buffered file streaming OR multi-threaded directory mirroring.
@@ -223,16 +223,22 @@ def safe_copy(src, dst, max_retries=7, chunk_size=128*1024*1024,
 
             for i in range(max_retries):
                 try:
-                    with tqdm(total=total_bytes, unit='B', unit_scale=True, 
-                              unit_divisor=1024, desc=desc_msg, leave=False) as bar:
-                        
+                    if show_progress:
+                        with tqdm(total=total_bytes, unit='B', unit_scale=True, 
+                                  unit_divisor=1024, desc=desc_msg, leave=False) as bar:
+                            if is_directory:
+                                if p_dst.exists():
+                                    shutil.rmtree(p_dst)
+                                _parallel_dir_copy_engine(p_src, p_dst, max_workers, bar)
+                            else:
+                                _stream_file_buffered(p_src, p_dst, chunk_size, bar)
+                    else:
                         if is_directory:
                             if p_dst.exists():
                                 shutil.rmtree(p_dst)
-                            _parallel_dir_copy_engine(p_src, p_dst, max_workers, bar)
+                            shutil.copytree(str(p_src), str(p_dst))
                         else:
-                            _stream_file_buffered(p_src, p_dst, chunk_size, bar)
-                            
+                            _stream_file_buffered(p_src, p_dst, chunk_size, bar=None)
                     break
                 
                 except Exception as e:

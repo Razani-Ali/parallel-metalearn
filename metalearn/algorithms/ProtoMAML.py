@@ -66,6 +66,7 @@ class ProtoMAML(MetaOptimizer):
         chunk_size: int = 8,
         device: Optional[torch.device] = None,
         backend: str = "vmap",
+        episodic_training: bool = False,
         **kwargs: Any,
     ):
         """
@@ -82,6 +83,7 @@ class ProtoMAML(MetaOptimizer):
             chunk_size (int): Batch chunk size processed concurrently to cap VRAM footprint.
             device (Optional[torch.device]): Target hardware compute device (CPU or GPU).
             backend (str): If you set it to "sequential", Vmap would be ignored and algorithm switches to for loop
+            episodic_training (bool): If backend is sequential and you want to update base model on enery single task within a batch, set to True
             **kwargs: Additional operational keyword arguments.
         """
         # Call parent MetaOptimizer constructor
@@ -101,6 +103,7 @@ class ProtoMAML(MetaOptimizer):
         self.multi_step_loss = multi_step_loss
         self.chunk_size = chunk_size
         self.backend = backend.lower()
+        self.episodic_training = episodic_training and backend == 'sequential'
 
         # Resolve target device and move all registered modules
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -521,7 +524,7 @@ class ProtoMAML(MetaOptimizer):
         # Extract effective batch size from the unbound tasks list
         batch_size = len(xs_tasks)
         # Compute individual task weighting factor for exact linear batch averaging
-        task_weight = 1.0 / batch_size
+        task_weight = 1.0 if self.episodic_training else (1.0 / batch_size)
 
         total_meta_loss = 0.0
         total_metric = 0.0
@@ -533,17 +536,23 @@ class ProtoMAML(MetaOptimizer):
             x_s, y_s = xs_tasks[i], ys_tasks[i]
             x_q, y_q = xq_tasks[i], yq_tasks[i]
 
+            if training and self.episodic_training:
+                self.optimizer.zero_grad()
+
             # Execute single task: computes loss/metric, executes backward if training=True, and returns detached outputs
             task_loss_val, task_metric_val, task_buf = process_single_task(
                 x_s, y_s, x_q, y_q, all_buffers, task_weight=task_weight, training=training
             )
 
+            if training and self.episodic_training:
+                self.optimizer.step()
+
             # Accumulate reporting scalar metrics
             loss_val = task_loss_val.item() if isinstance(task_loss_val, torch.Tensor) else task_loss_val
             metric_val = task_metric_val.item() if isinstance(task_metric_val, torch.Tensor) else task_metric_val
 
-            total_meta_loss += loss_val
-            total_metric += metric_val * task_weight
+            total_meta_loss += (loss_val / batch_size) if self.episodic_training else (loss_val * task_weight)
+            total_metric += metric_val / batch_size
 
             # Accumulate running model buffers (BatchNorm statistics and Proto tracking)
             with torch.no_grad():
@@ -757,7 +766,8 @@ class ProtoMAML(MetaOptimizer):
 
         # Step outer meta-optimizer and copy finalized buffers
         if training:
-            self.optimizer.step()
+            if not (getattr(self, "backend", "vmap") == "sequential" and self.episodic_training):
+                self.optimizer.step()
             with torch.no_grad():
                 for name, buffer_tensor in self.model.named_buffers():
                     if name in accumulated_buffers:
