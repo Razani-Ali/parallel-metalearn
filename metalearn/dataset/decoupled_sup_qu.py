@@ -396,7 +396,7 @@ class DecoupledMetaTaskDataset(Dataset):
         # Sample raw numpy instances
         if self.support_sampler is None or sum(s_samples_per_class) == 0:
             # Construct empty dummy support tensors matching signal shape
-            sample_x, _ = self.query_sampler.sample(target_classes[:1], (1,))
+            sample_x, *_ = self.query_sampler.sample(target_classes[:1], (1,))
             feature_shape = sample_x.shape[1:]
             
             x_s_raw = np.empty((0, *feature_shape), dtype=sample_x.dtype)
