@@ -470,8 +470,8 @@ class PrototypicalNetwork(MetaOptimizer):
         Ysupport = to_device(Ysupport, self.device)
 
         # Extract fixed parameters and initial buffers from the base model
-        params = dict(self.model.named_parameters())
-        all_buffers = dict(self.model.named_buffers())
+        params = dict(self.model.backbone.named_parameters())
+        all_buffers = dict(self.model.backbone.named_buffers())
 
         # Create an isolated clone of model buffers for this specific adaptation instance
         task_buffers = {k: v.clone() for k, v in all_buffers.items()}
@@ -485,8 +485,8 @@ class PrototypicalNetwork(MetaOptimizer):
             self.model.eval()
 
             # Extract representations via functional execution of the backbone network
-            out = torch.func.functional_call(self.model, states, (Xsupport,), forward_kwargs)
-            feat_s_flat = out["features"] if isinstance(out, dict) and "features" in out else out
+            feat_s = torch.func.functional_call(self.model.backbone, states, (Xsupport,), forward_kwargs)
+            feat_s_flat = feat_s.flatten(start_dim=1) if feat_s.dim() > 2 else feat_s
             # Flatten feature maps into 1D embeddings if output is multidimensional (e.g., CNNs)
             if feat_s_flat.dim() > 2:
                 feat_s_flat = feat_s_flat.flatten(start_dim=1)
