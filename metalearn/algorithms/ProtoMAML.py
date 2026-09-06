@@ -283,22 +283,23 @@ class ProtoMAML(MetaOptimizer):
         # Initialize inner optimizer state (e.g., zero momentum buffers)
         opt_state = self.inner_optimizer.init_state(fast_weights)
 
-        # Initialize classifier head weights dynamically using single support set prototypes
-        fast_weights = self.model.initialize_head_weights(
-            Xsupport,
-            Ysupport,
-            fast_weights,
-            task_buffers=task_buffers,
-            inner_step=0,
-            training=False,
-            **kwargs,
-        )
-
         # Check whether support set contains valid samples (skip adaptation for zero-shot)
         is_zero_shot = (Xsupport.shape[0] == 0)
 
         # Execute inner-loop gradient adaptation steps if support samples are present
         if not is_zero_shot:
+
+            # Initialize classifier head weights dynamically using single support set prototypes
+            fast_weights = self.model.initialize_head_weights(
+                Xsupport,
+                Ysupport,
+                fast_weights,
+                task_buffers=task_buffers,
+                inner_step=0,
+                training=False,
+                **kwargs,
+            )
+
             # Iterate through configured number of inner gradient steps
             for inner_step in range(self.num_inner_steps):
                 # Detach fast weights to truncate the autograd history graph in deployment

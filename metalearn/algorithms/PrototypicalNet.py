@@ -485,9 +485,11 @@ class PrototypicalNetwork(MetaOptimizer):
             self.model.eval()
 
             # Extract representations via functional execution of the backbone network
-            feat_s = torch.func.functional_call(self.model.backbone, states, (Xsupport,), forward_kwargs)
+            out = torch.func.functional_call(self.model, states, (Xsupport,), forward_kwargs)
+            feat_s_flat = out["features"] if isinstance(out, dict) and "features" in out else out
             # Flatten feature maps into 1D embeddings if output is multidimensional (e.g., CNNs)
-            feat_s_flat = feat_s.flatten(start_dim=1) if feat_s.dim() > 2 else feat_s
+            if feat_s_flat.dim() > 2:
+                feat_s_flat = feat_s_flat.flatten(start_dim=1)
 
             # Extract labels and optional sample masks
             labels_s = Ysupport["labels"] if isinstance(Ysupport, dict) else Ysupport
