@@ -168,7 +168,8 @@ def _stream_file_buffered(p_src: Path, p_dst: Path, chunk_size: int, bar: tqdm):
                 if not buf:
                     break
                 fdst.write(buf)
-                bar.update(len(buf))
+                if bar is not None:
+                    bar.update(len(buf))
 
     shutil.copystat(str(p_src), temp_dst)
     # Reusing your existing atomic file replacement mechanism
