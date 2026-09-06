@@ -35,7 +35,7 @@ class MetaTrain:
         """
         # Store primary dataset loaders and algorithm components
         self.TrainIterator = iter(TrainLoader)
-        self.ValIterator = iter(ValLoader)
+        self.ValIterator = iter(ValLoader) if ValLoader is not None else None
         self.algorithm = algorithm
         self.model = algorithm.model
         self.optimizer = algorithm.optimizer
@@ -117,7 +117,7 @@ class MetaTrain:
         msg += f"TRAIN - Loss: {updates['train_loss']:.4f} | Metric: {updates['train_metric']:.4f} | Time: {format_time(time_taken)}\n"
         
         # Append validation metrics only if evaluation took place
-        if evaluated_val and self.ValIterator:
+        if evaluated_val and updates.get('val_loss') is not None:
             msg += f"VAL   - Loss: {updates['val_loss']:.4f} | Metric: {updates['val_metric']:.4f}\n"
             
         self.logger.info(msg)
@@ -172,6 +172,7 @@ class MetaTrain:
         best_val_metric, best_val_loss = -float('inf'), float('inf')
         best_model_state, best_epoch = None, -1
         start_epoch, no_improve_count = 0, 0
+        best_train_loss = float('inf')
 
         # --- 2. Load Checkpoint (Resume State) ---
         if chkpt_path and os.path.exists(chkpt_path) and not replace_check_point:
@@ -244,7 +245,7 @@ class MetaTrain:
             needs_checkpoint = ((epoch + 1) % check_idx == 0) or (epoch == 0) or (epoch == epochs - 1)
             
             # Execute meta-validation step only at checkpoint steps
-            if self.ValIterator and needs_checkpoint:
+            if self.ValIterator is not None and needs_checkpoint:
                 val_trials = kwargs.get('val_trials', 50)
                 val_loss, val_metric = self.meta_test(
                     Loader=self.ValIterator, 
@@ -279,34 +280,44 @@ class MetaTrain:
 
             # Update progress bar display
             if needs_display:
-                pbar.set_postfix({
+                postfix_data = {
                     'Tr-Loss': f"{train_loss:.4f}",
                     'Tr-Acc': f"{train_metric * 100:.1f}%",
-                    'Val-Loss': last_val_loss_str,
-                    'Val-Acc': last_val_acc_str,
-                    "Best Vall-Acc": f"{best_val_metric * 100:.1f}%",
-                    "Best Epoch": best_epoch,
-                })
-
+                }
+                if self.ValIterator is not None:
+                    postfix_data.update({
+                        'Val-Loss': last_val_loss_str,
+                        'Val-Acc': last_val_acc_str,
+                        'Best Val-Acc': f"{best_val_metric * 100:.1f}%" if best_val_metric != -float('inf') else "N/A",
+                        'Best Epoch': best_epoch + 1,
+                    })
+                pbar.set_postfix(postfix_data)
                 pbar.update((epoch + 1) - pbar.n)
 
             # --- 4. Model Selection & Early Stopping ---
-            if needs_checkpoint and self.ValIterator:
+            if needs_checkpoint:
                 # Track best validation metric state
-                if val_metric >= best_val_metric:
-                    best_val_metric = val_metric
-                    best_epoch = epoch
-                    best_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+                if self.ValIterator is not None:
+                    # Save based on best validation score
+                    if val_metric >= best_val_metric:
+                        best_val_metric = val_metric
+                        best_epoch = epoch
+                        best_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-                # Track best validation loss and manage early stopping counter
-                if val_loss <= best_val_loss - erl_stp_tresh:
-                    best_val_loss = val_loss
-                    no_improve_count = 0
-                elif patience:
-                    no_improve_count += 1
-                    if no_improve_count >= patience:
-                        self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
-                        break
+                    if val_loss <= best_val_loss - erl_stp_tresh:
+                        best_val_loss = val_loss
+                        no_improve_count = 0
+                    elif patience:
+                        no_improve_count += 1
+                        if no_improve_count >= patience:
+                            self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
+                            break
+                else:
+                    # Save based on best train score
+                    if train_loss < best_train_loss:
+                        best_train_loss = train_loss
+                        best_epoch = epoch
+                        best_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
             # Step learning rate scheduler
             if self.scheduler:
